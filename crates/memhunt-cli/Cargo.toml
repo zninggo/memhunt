@@ -1,0 +1,18 @@
+[package]
+name = "memhunt-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hunt AES keys and IVs in memory dumps from a known ciphertext (CLI)"
+
+[[bin]]
+name = "memhunt"
+path = "src/main.rs"
+
+[dependencies]
+memhunt-core = { path = "../memhunt-core" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+rayon = "1"
