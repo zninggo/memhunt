@@ -17,10 +17,12 @@ fn bin() -> &'static str {
 
 /// Plant `KEY` in a deterministic small dump and return a temp path + ECB
 /// ciphertext of PLAINTEXT (openssl-free, so tests run anywhere).
-fn make_fixture() -> (std::path::PathBuf, String) {
+/// `tag` keeps parallel tests in separate fixture dirs (they share a PID).
+fn make_fixture(tag: &str) -> (std::path::PathBuf, String) {
     let mut dump = vec![0u8; 4096];
     dump[2048..2048 + 16].copy_from_slice(&KEY);
-    let fixt_dir = std::env::temp_dir().join(format!("memhunt_clitest_{}", std::process::id()));
+    let fixt_dir =
+        std::env::temp_dir().join(format!("memhunt_clitest_{}_{}", std::process::id(), tag));
     std::fs::create_dir_all(&fixt_dir).unwrap();
     let dump_path = fixt_dir.join("dump.bin");
     std::fs::write(&dump_path, &dump).unwrap();
@@ -42,7 +44,7 @@ fn run(dump: &str, ct: &str, oracle: &str) -> std::process::Output {
 
 #[test]
 fn exit_code_0_on_hit() {
-    let (dump, ct) = make_fixture();
+    let (dump, ct) = make_fixture("hit");
     let out = run(dump.to_str().unwrap(), &ct, "utf8");
     assert_eq!(out.status.code(), Some(0), "hit must exit 0");
     assert!(
@@ -54,7 +56,7 @@ fn exit_code_0_on_hit() {
 
 #[test]
 fn exit_code_1_on_no_hit() {
-    let (dump, _) = make_fixture();
+    let (dump, _) = make_fixture("nohit");
     // Ciphertext encrypted with a key that is NOT planted => no hit.
     let other_ct = hex::encode([0xabu8; 16]);
     let out = run(dump.to_str().unwrap(), &other_ct, "utf8");
