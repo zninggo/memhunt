@@ -215,15 +215,21 @@ fn dispatch(method: &str, params: &Value) -> Result<Value, String> {
                 .ok_or("tools/call requires name")?;
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             let result = match name {
-                "memhunt_scan" => tool_scan(&args)?,
-                "memhunt_key_schedules" => tool_key_schedules(&args)?,
-                "memhunt_hash_scan" => tool_hash_scan(&args)?,
+                "memhunt_scan" => tool_scan(&args),
+                "memhunt_key_schedules" => tool_key_schedules(&args),
+                "memhunt_hash_scan" => tool_hash_scan(&args),
                 other => return Err(format!("unknown tool '{other}'")),
             };
-            Ok(json!({
-                "content": [{"type": "text", "text": result.to_string()}],
-                "isError": false
-            }))
+            match result {
+                Ok(result) => Ok(json!({
+                    "content": [{"type": "text", "text": result.to_string()}],
+                    "isError": false
+                })),
+                Err(message) => Ok(json!({
+                    "content": [{"type": "text", "text": message}],
+                    "isError": true
+                })),
+            }
         }
         other => Err(format!("unknown method '{other}'")),
     }
