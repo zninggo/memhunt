@@ -9,7 +9,7 @@
 //! validation; full decryption happens once per hit.
 
 use crate::oracle::{best_match, Oracle};
-use crate::report::{Confidence, Hit, Mode, ScanResult, ScanStats};
+use crate::report::{Confidence, Hit, IvCandidate, Mode, ScanResult, ScanStats};
 use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -83,6 +83,23 @@ fn strip_zero(plaintext: &mut Vec<u8>) -> bool {
 
 fn to_utf8(bytes: &[u8]) -> Option<String> {
     std::str::from_utf8(bytes).ok().map(|s| s.to_string())
+}
+
+/// 0..=1000 score of how "plaintext-like" a 16-byte block is: valid UTF-8 and
+/// mostly printable. Used as a tie-breaker when ranking IV candidates under a
+/// weak oracle (e.g. `utf8` alone), where many blocks qualify as "printable".
+fn block0_plausibility(block: &[u8; BLOCK]) -> u32 {
+    let Ok(s) = std::str::from_utf8(block) else {
+        return 0;
+    };
+    if s.is_empty() {
+        return 0;
+    }
+    let printable = s
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\r' || *c == '\t')
+        .count();
+    ((printable as u64 * 1000) / s.chars().count() as u64) as u32
 }
 
 /// Scan a dump for AES keys that decrypt `ciphertext` into oracle-valid plaintext.
@@ -183,6 +200,7 @@ where
                     offset,
                     None,
                     None,
+                    Vec::new(),
                     &mut pt,
                     name,
                     conf,
@@ -232,30 +250,52 @@ where
                     }
 
                     // Resolve block 0 via fixed IV or an IV scan pass.
-                    let (iv_hex, iv_offset, head_block) = match config.fixed_iv {
+                    // Note: IV candidates are validated against the *verified*
+                    // decrypted head (block 0 + the same blocks the key scan
+                    // validated), NOT the full tail — the full tail may be
+                    // PKCS7/zero-padded, and pad bytes legitimately fail the
+                    // JSON/utf8 control-char checks.
+                    let verified_tail: Vec<u8> =
+                        tail.iter().take(VERIFY_BLOCKS).flat_map(|b| *b).collect();
+                    let (iv_hex, iv_offset, head_block, iv_candidates) = match config.fixed_iv {
                         Some(iv) => {
                             let mut b0 = *blocks[0];
                             cipher.decrypt_block(GenericArray::from_mut_slice(&mut b0));
                             for j in 0..BLOCK {
                                 b0[j] ^= iv[j];
                             }
-                            (Some(hex::encode(iv)), None, b0.to_vec())
+                            (Some(hex::encode(iv)), None, b0.to_vec(), Vec::new())
                         }
                         None if config.scan_iv && dump.len() >= BLOCK => {
                             let mut b0 = *blocks[0];
                             cipher.decrypt_block(GenericArray::from_mut_slice(&mut b0));
-                            match find_iv(dump, &b0, oracles) {
-                                Some((iv_off, iv, first)) => {
-                                    (Some(hex::encode(iv)), Some(iv_off), first.to_vec())
-                                }
-                                None => (None, None, vec![b'?'; BLOCK]),
+                            let cands = find_iv(dump, &b0, &verified_tail, oracles);
+                            let iv_candidates = cands
+                                .iter()
+                                .map(|(off, iv, first, name, conf)| IvCandidate {
+                                    iv_hex: hex::encode(iv),
+                                    iv_offset: *off,
+                                    confidence: *conf,
+                                    block0_utf8: to_utf8(first),
+                                    block0_hex: hex::encode(first),
+                                    matched_by: name.to_string(),
+                                })
+                                .collect();
+                            match cands.into_iter().next() {
+                                Some((iv_off, iv, first, _n, _c)) => (
+                                    Some(hex::encode(iv)),
+                                    Some(iv_off),
+                                    first.to_vec(),
+                                    iv_candidates,
+                                ),
+                                None => (None, None, vec![b'?'; BLOCK], iv_candidates),
                             }
                         }
-                        None => (None, None, vec![b'?'; BLOCK]),
+                        None => (None, None, vec![b'?'; BLOCK], Vec::new()),
                     };
 
                     let mut pt = head_block;
-                    pt.extend(tail.concat());
+                    pt.extend(tail.iter().flat_map(|b| *b));
                     return Some(finalize_hit(
                         algo,
                         Mode::Cbc,
@@ -263,6 +303,7 @@ where
                         offset,
                         iv_hex,
                         iv_offset,
+                        iv_candidates,
                         &mut pt,
                         name,
                         conf,
@@ -275,32 +316,76 @@ where
         .collect()
 }
 
-/// Scan the dump for 16-byte windows that, XORed with the pre-IV first
-/// decryption, yield oracle-valid plaintext. All candidates are collected
-/// (weak oracles produce false positives on random data), then ranked:
-/// higher oracle confidence first, lower offset first.
+/// Number of plausible-IV candidates kept (best first) from an IV scan pass.
+const IV_CANDIDATES_MAX: usize = 8;
+/// Scan the dump for 16-byte windows that, used as a CBC IV, decrypt block 0
+/// into a plausible plaintext. Unlike key-scan verification (which can only
+/// look at block 0, since blocks 1..n are IV-independent), a candidate IV is
+/// validated against the FULL decrypted plaintext — block 0 XORed with the
+/// candidate, concatenated with the already-verified blocks 1..n. This lets
+/// `known:<fragment>` oracles (and JSON structure that spans the boundary)
+/// disambiguate candidates that a block-0-only check could not.
+///
+/// All qualifying candidates are collected, then ranked by (oracle confidence
+/// desc, block0 printable-ratio desc, offset asc). The first
+/// [`IV_CANDIDATES_MAX`] are returned, best first — weak oracles (e.g. `utf8`
+/// alone) legitimately produce plausible non-unique hits, so callers should not
+/// treat the top candidate as guaranteed when multiple rank together.
+/// One valid IV candidate before ranking; kept compact for the parallel scan.
+struct IvRawCandidate {
+    offset: usize,
+    iv: [u8; BLOCK],
+    b0: [u8; BLOCK],
+    name: &'static str,
+    confidence: Confidence,
+    plaus: u32,
+}
+
+/// A ranked IV candidate (offset, raw IV bytes, its decrypted block 0, the
+/// matching oracle and its confidence), best first.
+type IvHit = (usize, [u8; BLOCK], [u8; BLOCK], &'static str, Confidence);
+
 fn find_iv(
     dump: &[u8],
     dec0: &[u8; BLOCK],
+    tail: &[u8],
     oracles: &[Box<dyn Oracle>],
-) -> Option<(usize, [u8; BLOCK], [u8; BLOCK])> {
-    let mut candidates: Vec<(usize, [u8; BLOCK], [u8; BLOCK], u8)> = dump
+) -> Vec<IvHit> {
+    let mut candidates: Vec<IvRawCandidate> = dump
         .par_windows(BLOCK)
         .enumerate()
         .filter_map(|(offset, iv)| {
-            let mut first = [0u8; BLOCK];
+            let mut b0 = [0u8; BLOCK];
             for j in 0..BLOCK {
-                first[j] = dec0[j] ^ iv[j];
+                b0[j] = dec0[j] ^ iv[j];
             }
-            best_match(oracles, &first)
-                .map(|(_, c)| (offset, iv.try_into().unwrap(), first, c.rank()))
+            // Full decrypted plaintext up to the candidate's block 0.
+            let mut full = b0.to_vec();
+            full.extend_from_slice(tail);
+            let matched = best_match(oracles, &full)?;
+            let plaus = block0_plausibility(&b0);
+            Some(IvRawCandidate {
+                offset,
+                iv: iv.try_into().unwrap(),
+                b0,
+                name: matched.0,
+                confidence: matched.1,
+                plaus,
+            })
         })
         .collect();
-    candidates.sort_by(|a, b| b.3.cmp(&a.3).then(a.0.cmp(&b.0)));
+    // confidence desc, block-0 plausibility desc, offset asc
+    candidates.sort_by(|a, b| {
+        b.confidence
+            .rank()
+            .cmp(&a.confidence.rank())
+            .then(b.plaus.cmp(&a.plaus).then(a.offset.cmp(&b.offset)))
+    });
     candidates
         .into_iter()
-        .next()
-        .map(|(offset, iv, first, _)| (offset, iv, first))
+        .take(IV_CANDIDATES_MAX)
+        .map(|c| (c.offset, c.iv, c.b0, c.name, c.confidence))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -311,6 +396,7 @@ fn finalize_hit(
     key_offset: usize,
     iv_hex: Option<String>,
     iv_offset: Option<usize>,
+    iv_candidates: Vec<IvCandidate>,
     plaintext: &mut Vec<u8>,
     matched_by: &str,
     confidence: Confidence,
@@ -334,6 +420,7 @@ fn finalize_hit(
         plaintext_hex: hex::encode(plaintext),
         matched_by: matched_by.to_string(),
         confidence,
+        iv_candidates,
     }
 }
 

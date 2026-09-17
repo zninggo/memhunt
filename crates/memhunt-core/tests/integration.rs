@@ -9,27 +9,36 @@ const IV: [u8; 16] = [
     0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f,
 ];
 const PLAINTEXT: &[u8] = b"{\"user\":\"admin\",\"role\":\"superuser\",\"exp\":1750000000}";
-const KEY_OFFSET: usize = 600_000;
-const IV_OFFSET: usize = 600_100;
-const DUMP_SIZE: usize = 1024 * 1024;
+const KEY_OFFSET: usize = 150_000;
+const IV_OFFSET: usize = 150_100;
+const DUMP_SIZE: usize = 256 * 1024;
+
+/// Offset/IV for the larger (release-only) throughput smoke.
+const SMOKE_KEY_OFFSET: usize = 600_000;
+const SMOKE_IV_OFFSET: usize = 600_100;
+const SMOKE_DUMP_SIZE: usize = 1024 * 1024;
 
 fn oracles() -> Vec<Box<dyn Oracle>> {
     vec![Box::new(Utf8Oracle), Box::new(JsonOracle)]
 }
 
 /// Deterministic pseudo-random dump filler (xorshift64*).
-fn make_dump() -> Vec<u8> {
+fn make_dump_size(size: usize) -> Vec<u8> {
     let mut state = 0x9E3779B97F4A7C15u64;
-    let mut dump = Vec::with_capacity(DUMP_SIZE);
-    while dump.len() < DUMP_SIZE {
+    let mut dump = Vec::with_capacity(size);
+    while dump.len() < size {
         state ^= state >> 12;
         state ^= state << 25;
         state ^= state >> 27;
         let bytes = state.wrapping_mul(0x2545F4914F6CDD1D).to_le_bytes();
         dump.extend_from_slice(&bytes);
     }
-    dump.truncate(DUMP_SIZE);
+    dump.truncate(size);
     dump
+}
+
+fn make_dump() -> Vec<u8> {
+    make_dump_size(DUMP_SIZE)
 }
 
 fn pkcs7(data: &[u8]) -> Vec<u8> {
@@ -75,9 +84,13 @@ fn encrypt_cbc(plaintext: &[u8], iv: &[u8; 16]) -> Vec<u8> {
 }
 
 fn dump_with_key_and_iv() -> Vec<u8> {
-    let mut dump = make_dump();
-    dump[KEY_OFFSET..KEY_OFFSET + 16].copy_from_slice(&KEY);
-    dump[IV_OFFSET..IV_OFFSET + 16].copy_from_slice(&IV);
+    dump_with_key_and_iv_offsets(DUMP_SIZE, KEY_OFFSET, IV_OFFSET)
+}
+
+fn dump_with_key_and_iv_offsets(size: usize, key_off: usize, iv_off: usize) -> Vec<u8> {
+    let mut dump = make_dump_size(size);
+    dump[key_off..key_off + 16].copy_from_slice(&KEY);
+    dump[iv_off..iv_off + 16].copy_from_slice(&IV);
     dump
 }
 
@@ -163,9 +176,76 @@ fn no_high_confidence_hits_on_random_data() {
     );
 }
 
+/// Reproduce handover bug 2b: a `known:<fragment>` whose fragment lies in a
+/// later plaintext block (block 1, not block 0) must no longer defeat the IV
+/// pass — it must return a decoded block 0 (a candidate), not 16 '?'.
+///
+/// With only a `known:` oracle and the fragment outside block 0, the oracle
+/// cannot rank block-0 content (it matches every window's shared tail), so the
+/// result is genuinely ambiguous; the honest contract is "no longer fails".
 #[test]
-fn throughput_smoke_1mib() {
+fn known_fragment_in_later_block_still_finds_iv() {
+    // "doctor" starts at byte 22 => inside block 1 (bytes 16..32).
+    let fragment = b"doctor";
+    let mut pt = b"{\"greet\":\"".to_vec();
+    pt.extend(std::iter::repeat_n(b'x', 22 - pt.len())); // pad to byte 22
+    pt.extend_from_slice(fragment);
+    pt.extend_from_slice(b"\",\"ok\":true}");
+    assert_eq!(&pt[22..22 + 6], fragment);
+    assert!(
+        !pt[0..16].windows(6).any(|w| w == fragment),
+        "fragment must be in block 1+"
+    );
+
+    let ciphertext = encrypt_cbc(&pt, &IV);
     let dump = dump_with_key_and_iv();
+    let oracles: Vec<Box<dyn Oracle>> = vec![Box::new(memhunt_core::KnownPlaintextOracle {
+        fragment: fragment.to_vec(),
+    })];
+    let result = scan(&dump, &ciphertext, &oracles, &ScanConfig::default()).unwrap();
+    let hit = result
+        .hits
+        .iter()
+        .find(|h| h.key_offset == KEY_OFFSET && h.mode == memhunt_core::Mode::Cbc)
+        .expect("expected CBC hit at planted key");
+    // Bug 2b symptom: the IV pass must no longer return the "all '?'" failure.
+    assert!(
+        hit.iv_candidates.iter().any(|c| c.iv_offset == IV_OFFSET)
+            || (!hit.plaintext_utf8.is_none()
+                && !hit
+                    .plaintext_utf8
+                    .as_deref()
+                    .unwrap_or("")
+                    .starts_with(&"?".repeat(16))),
+        "block 0 must be decoded (found IV or at least a non-'?' candidate): plaintext={:?}",
+        hit.plaintext_utf8
+    );
+    assert!(
+        !hit.iv_candidates.is_empty(),
+        "IV scan must return candidates"
+    );
+}
+
+/// Handover bug 1 (exit-code): a no-hit scan must exit 1, not 0. The library
+/// `scan` has no exit code, so this is enforced at the CLI layer; here we just
+/// assert the scan reports zero hits on an unrelated ciphertext.
+#[test]
+fn no_hits_when_ciphertext_uses_unknown_key() {
+    let dump = make_dump();
+    let ciphertext = encrypt_ecb(PLAINTEXT); // key is NOT planted
+    let result = scan(&dump, &ciphertext, &oracles(), &ScanConfig::default()).unwrap();
+    assert!(
+        result.hits.is_empty(),
+        "expected no hits: {:?}",
+        result.hits.iter().map(|h| &h.key_hex).collect::<Vec<_>>()
+    );
+}
+
+/// Throughput smoke (release-only, see [#ignore] note above).
+#[test]
+#[ignore = "1 MiB in debug is too slow for CI; run with --release -- --ignored"]
+fn throughput_smoke_1mib() {
+    let dump = dump_with_key_and_iv_offsets(SMOKE_DUMP_SIZE, SMOKE_KEY_OFFSET, SMOKE_IV_OFFSET);
     let ciphertext = encrypt_ecb(PLAINTEXT);
     let start = Instant::now();
     let result = scan(&dump, &ciphertext, &oracles(), &ScanConfig::default()).unwrap();
@@ -173,8 +253,8 @@ fn throughput_smoke_1mib() {
     assert!(!result.hits.is_empty());
     eprintln!(
         "throughput: {} MiB scanned in {:.2}s ({:.1} MiB/s)",
-        DUMP_SIZE as f64 / (1024.0 * 1024.0),
+        SMOKE_DUMP_SIZE as f64 / (1024.0 * 1024.0),
         secs,
-        DUMP_SIZE as f64 / (1024.0 * 1024.0) / secs
+        SMOKE_DUMP_SIZE as f64 / (1024.0 * 1024.0) / secs
     );
 }

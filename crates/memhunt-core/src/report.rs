@@ -25,6 +25,23 @@ pub enum Mode {
     Cbc,
 }
 
+/// One plausible IV location found by the IV scan pass.
+///
+/// Multiple candidates are kept for weak oracles (e.g. `utf8` alone), ordered
+/// by descending confidence. Consumers should treat a non-unique top candidate
+/// as "best effort", and prefer higher-confidence entries.
+#[derive(Debug, Clone, Serialize)]
+pub struct IvCandidate {
+    pub iv_hex: String,
+    pub iv_offset: usize,
+    pub confidence: Confidence,
+    /// The oracle that matched this candidate's decrypted plaintext.
+    pub matched_by: String,
+    /// First 16 bytes of the candidate's plaintext (best guess), for eyeballing.
+    pub block0_utf8: Option<String>,
+    pub block0_hex: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Hit {
     pub algo: String,
@@ -38,6 +55,9 @@ pub struct Hit {
     pub plaintext_hex: String,
     pub matched_by: String,
     pub confidence: Confidence,
+    /// All plausible IV candidates from the IV scan, best first. Populated
+    /// only when an IV scan ran for a CBC hit; empty for ECB/fixed-IV hits.
+    pub iv_candidates: Vec<IvCandidate>,
 }
 
 /// Statistics of one scan run.

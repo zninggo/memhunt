@@ -64,6 +64,33 @@ Only the first two ciphertext blocks are decrypted during candidate
 validation; full decryption and padding checks (pkcs7 / zero) run once per
 hit. Scan with `rayon` across all cores and AES-NI when available.
 
+### IV candidates
+
+Because CBC key verification is IV-independent (`P[i] = D(K, C[i]) XOR
+C[i-1]`), the IV itself is located in a second scan pass after a hit. A
+candidate IV is accepted when the concatenation of its decrypted block 0 and
+the (already-verified) following blocks passes an oracle — so `known:<text>`
+fragments in any block, and JSON structure that spans the block-0 boundary,
+are honored. Candidates are ranked by oracle confidence, then block-0
+"plaintext-likeness", then offset, and up to 8 are returned as
+`iv_candidates` (best first) in JSON output; the human report prints each.
+
+**Weak oracles are honest about ambiguity.** With `utf8` alone, many random
+16-byte windows decrypt to "printable" text, so several candidate IVs can tie —
+the top pick is best-effort, not guaranteed. Add a block-0-sensitive oracle
+(`json`, or a `known:<...>` fragment that sits in the first plaintext block) to
+pin the unique IV. The default `utf8,json` set usually resolves it.
+
+### Key / ciphertext size limits
+
+Only the first two ciphertext blocks (`VERIFY_BLOCKS = 2`) are consulted to
+validate a candidate key. That means:
+- In **CBC**, a `known:<fragment>` must sit inside plaintext bytes 16..48
+  (blocks 1..2) to confirm the key.
+- In **ECB**, the fragment must sit inside plaintext bytes 0..32 (blocks 0..1).
+- Ciphertext must be a multiple of 16 bytes; single-block CBC scans need a
+  fixed `--iv`.
+
 Measured on one test machine: a 64 MiB dump scanned across all three AES key
 sizes (201M candidate windows) in ~9s — roughly 50x the throughput of the
 original Python implementation.

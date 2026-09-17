@@ -133,7 +133,7 @@ fn main() -> ExitCode {
         threads,
     } = cli.command;
 
-    let run = || -> Result<(), String> {
+    let run = || -> Result<usize, String> {
         if let Some(n) = threads {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
@@ -194,11 +194,12 @@ fn main() -> ExitCode {
         if result.hits.is_empty() {
             eprintln!("memhunt: no hits");
         }
-        Ok(())
+        Ok(result.hits.len())
     };
 
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(0) => ExitCode::from(1),
+        Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("memhunt: error: {e}");
             ExitCode::from(2)
@@ -222,6 +223,18 @@ fn print_human(out: &mut impl Write, hit: &memhunt_core::Hit) {
             .map(|o| format!("@{o}"))
             .unwrap_or_else(|| "fixed".into());
         let _ = writeln!(out, "       iv ={} {}", off, iv);
+    }
+    for (i, c) in hit.iv_candidates.iter().enumerate() {
+        let preview = c
+            .block0_utf8
+            .as_deref()
+            .map(|s| s.chars().take(40).collect::<String>())
+            .unwrap_or_else(|| "(non-utf8)".to_string());
+        let _ = writeln!(
+            out,
+            "       iv-candidate[{}] @{} {:?} matched_by={} block0={preview}",
+            i, c.iv_offset, c.confidence, c.matched_by,
+        );
     }
     if let Some(pad) = &hit.padding {
         let _ = writeln!(out, "       padding: {pad}");
