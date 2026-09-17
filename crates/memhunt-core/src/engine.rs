@@ -1,9 +1,13 @@
 //! Oracle-driven block-cipher key hunting over a memory dump.
 //!
-//! Two search strategies per candidate key window (no IV required):
+//! Search strategies per candidate key window:
 //! - ECB: decrypt the first blocks of the ciphertext, validate with oracles.
 //! - CBC: decrypt blocks 1..n (which do not depend on the IV), validate.
 //!   On a hit, a second pass scans the dump for the IV.
+//! - CTR: decrypt the first two keystream blocks with an explicit counter,
+//!   validate with oracles, then fully decrypt on a hit.
+//! - GCM: with a tag, verify the ciphertext/tag pair deterministically;
+//!   without a tag, use the same oracle path as CTR.
 //!
 //! The engine is cipher-agnostic: it operates on [`BlockCipher`] trait
 //! objects, so AES (cipher 0.4 family) and DES/3DES/SM4 (cipher 0.5 family)
@@ -26,12 +30,33 @@ const VERIFY_BLOCKS: usize = 2;
 pub struct ScanConfig {
     /// Which cipher families/variants to try.
     pub ciphers: Vec<CipherChoice>,
+    /// Cipher mode selected by `--cipher` tokens.
+    pub mode: CipherMode,
     /// Stop after this many hits (0 = unlimited).
     pub max_hits: usize,
     /// After a CBC hit, scan the dump for the IV.
     pub scan_iv: bool,
     /// Use a fixed IV instead of scanning (skips CBC-without-IV limitations).
     pub fixed_iv: Option<Vec<u8>>,
+    /// Initial counter block for CTR, or 12-byte nonce for GCM.
+    pub nonce: Option<Vec<u8>>,
+    /// GCM authentication tag; enables deterministic zero-false-positive hunting.
+    pub tag: Option<Vec<u8>>,
+    /// Additional authenticated data for GCM tag verification.
+    pub aad: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CipherMode {
+    Block,
+    Ctr,
+    Gcm,
+}
+
+#[derive(Debug, Clone)]
+pub struct CipherSelection {
+    pub ciphers: Vec<CipherChoice>,
+    pub mode: CipherMode,
 }
 
 /// A cipher to hunt with, as a CLI-friendly enum.
@@ -57,23 +82,45 @@ impl CipherChoice {
         }
     }
 
-    /// Parse one spec token: `aes-128`, `des`, `3des`, `sm4`, `aes` (= all
-    /// three sizes), `all`.
-    pub fn parse_list(spec: &str) -> Result<Vec<Self>, String> {
+    pub fn is_aes(&self) -> bool {
+        matches!(self, Self::Aes128 | Self::Aes192 | Self::Aes256)
+    }
+
+    /// Parse a cipher list. Tokens may select CTR or GCM with a `-ctr` or
+    /// `-gcm` suffix; all tokens must select the same mode.
+    pub fn parse_list(spec: &str) -> Result<CipherSelection, String> {
         let mut out = Vec::new();
+        let mut mode = None;
         for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            match part.to_ascii_lowercase().as_str() {
+            let lower = part.to_ascii_lowercase();
+            let (token, token_mode) = if let Some(token) = lower.strip_suffix("-ctr") {
+                (token, CipherMode::Ctr)
+            } else if let Some(token) = lower.strip_suffix("-gcm") {
+                (token, CipherMode::Gcm)
+            } else {
+                (lower.as_str(), CipherMode::Block)
+            };
+            if let Some(mode) = mode {
+                if mode != token_mode {
+                    return Err("cipher list cannot mix modes".into());
+                }
+            } else {
+                mode = Some(token_mode);
+            }
+            match token {
                 "aes-128" | "aes128" => out.push(Self::Aes128),
                 "aes-192" | "aes192" => out.push(Self::Aes192),
                 "aes-256" | "aes256" => out.push(Self::Aes256),
                 "aes" => out.extend([Self::Aes128, Self::Aes192, Self::Aes256]),
-                "des" => out.push(Self::Des),
-                "3des" | "3des-ede3" | "tdes" => out.push(Self::TdesEde3),
-                "sm4" => out.push(Self::Sm4),
-                "all" => out.extend(Self::all()),
+                "des" if token_mode == CipherMode::Block => out.push(Self::Des),
+                "3des" | "3des-ede3" | "tdes" if token_mode == CipherMode::Block => {
+                    out.push(Self::TdesEde3)
+                }
+                "sm4" if token_mode == CipherMode::Block => out.push(Self::Sm4),
+                "all" if token_mode == CipherMode::Block => out.extend(Self::all()),
                 other => {
                     return Err(format!(
-                        "unknown cipher '{other}' (aes-128 | aes-192 | aes-256 | des | 3des | sm4 | all)"
+                        "unknown cipher '{other}' (aes-128 | aes-192 | aes-256 | des | 3des | sm4 | all | aes-<size>-ctr | aes-<size>-gcm)"
                     ))
                 }
             }
@@ -81,9 +128,17 @@ impl CipherChoice {
         if out.is_empty() {
             return Err("no cipher specified".into());
         }
+        if token_mode_requires_aes(mode.unwrap_or(CipherMode::Block))
+            && out.iter().any(|choice| !choice.is_aes())
+        {
+            return Err("CTR and GCM support AES keys only".into());
+        }
         out.sort();
         out.dedup();
-        Ok(out)
+        Ok(CipherSelection {
+            ciphers: out,
+            mode: mode.unwrap_or(CipherMode::Block),
+        })
     }
 
     pub fn all() -> [Self; 6] {
@@ -109,6 +164,10 @@ impl CipherChoice {
     }
 }
 
+fn token_mode_requires_aes(mode: CipherMode) -> bool {
+    mode != CipherMode::Block
+}
+
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
@@ -117,9 +176,13 @@ impl Default for ScanConfig {
                 CipherChoice::Aes192,
                 CipherChoice::Aes256,
             ],
+            mode: CipherMode::Block,
             max_hits: 0,
             scan_iv: true,
             fixed_iv: Option::None,
+            nonce: Option::None,
+            tag: Option::None,
+            aad: Option::None,
         }
     }
 }
@@ -185,6 +248,57 @@ fn block0_plausibility(block: &[u8]) -> u32 {
     ((printable as u64 * 1000) / s.chars().count() as u64) as u32
 }
 
+fn validate_config(config: &ScanConfig) -> Result<(), String> {
+    match config.mode {
+        CipherMode::Block => {
+            if config.nonce.is_some() {
+                return Err("nonce is only valid for CTR or GCM".into());
+            }
+            if config.tag.is_some() {
+                return Err("tag is only valid for GCM".into());
+            }
+            if config.aad.is_some() {
+                return Err("aad is only valid for GCM".into());
+            }
+        }
+        CipherMode::Ctr => {
+            if config.fixed_iv.is_some() {
+                return Err("use --nonce, not --iv, for CTR".into());
+            }
+            if config.tag.is_some() {
+                return Err("tag is only valid for GCM".into());
+            }
+            if config.aad.is_some() {
+                return Err("aad is only valid for GCM".into());
+            }
+            let nonce = config.nonce.as_deref().ok_or("nonce is required for CTR")?;
+            if nonce.len() != 16 {
+                return Err("CTR nonce must be a 16-byte initial counter block".into());
+            }
+        }
+        CipherMode::Gcm => {
+            if config.fixed_iv.is_some() {
+                return Err("use --nonce, not --iv, for GCM".into());
+            }
+            let nonce = config.nonce.as_deref().ok_or("nonce is required for GCM")?;
+            if nonce.len() != 12 {
+                return Err("GCM nonce must be 12 bytes".into());
+            }
+            if let Some(tag) = config.tag.as_deref() {
+                if tag.len() != 16 {
+                    return Err("GCM tag must be 16 bytes".into());
+                }
+            } else if config.aad.is_some() {
+                return Err("GCM aad requires a tag".into());
+            }
+        }
+    }
+    if config.mode != CipherMode::Block && config.ciphers.iter().any(|choice| !choice.is_aes()) {
+        return Err("CTR and GCM support AES keys only".into());
+    }
+    Ok(())
+}
+
 /// Scan a dump for keys that decrypt `ciphertext` into oracle-valid plaintext.
 pub fn scan(
     dump: &[u8],
@@ -192,7 +306,8 @@ pub fn scan(
     oracles: &[Box<dyn Oracle>],
     config: &ScanConfig,
 ) -> Result<ScanResult, String> {
-    if oracles.is_empty() {
+    validate_config(config)?;
+    if (config.mode != CipherMode::Gcm || config.tag.is_none()) && oracles.is_empty() {
         return Err("no oracle specified".into());
     }
 
@@ -208,37 +323,55 @@ pub fn scan(
         if dump.len() < key_len {
             continue;
         }
-        let blocks = split_blocks(ciphertext, block)?;
         let algo = cipher.algo().to_string();
-        let iv = config
-            .fixed_iv
-            .as_ref()
-            .map(|iv| {
-                let arr: &[u8] = iv;
-                if arr.len() != block {
-                    return Err(format!(
-                        "fixed IV length {} does not match {} block size {}",
-                        arr.len(),
-                        algo,
-                        block
-                    ));
-                }
-                Ok(arr.to_vec())
-            })
-            .transpose()?;
 
-        let hits = hunt(
-            dump,
-            &blocks,
-            block,
-            cipher.as_ref(),
-            oracles,
-            config,
-            &algo,
-            iv,
-            &tried,
-            &stop,
-        );
+        let hits = if config.mode == CipherMode::Block {
+            let blocks = split_blocks(ciphertext, block)?;
+            let iv = config
+                .fixed_iv
+                .as_ref()
+                .map(|iv| {
+                    let arr: &[u8] = iv;
+                    if arr.len() != block {
+                        return Err(format!(
+                            "fixed IV length {} does not match {} block size {}",
+                            arr.len(),
+                            algo,
+                            block
+                        ));
+                    }
+                    Ok(arr.to_vec())
+                })
+                .transpose()?;
+
+            hunt(
+                dump,
+                &blocks,
+                block,
+                cipher.as_ref(),
+                oracles,
+                config,
+                &algo,
+                iv,
+                &tried,
+                &stop,
+            )
+        } else {
+            if ciphertext.is_empty() {
+                return Err("ciphertext is empty".into());
+            }
+            hunt_stream(
+                dump,
+                ciphertext,
+                block,
+                cipher.as_ref(),
+                oracles,
+                config,
+                &algo,
+                &tried,
+                &stop,
+            )
+        };
         all_hits.extend(hits);
         if config.max_hits > 0 && all_hits.len() >= config.max_hits {
             all_hits.truncate(config.max_hits);
@@ -319,6 +452,174 @@ fn find_iv(
         .take(IV_CANDIDATES_MAX)
         .map(|c| (c.offset, c.iv, c.b0, c.name, c.confidence))
         .collect()
+}
+
+fn increment_counter(counter: &mut [u8; 16]) {
+    let value = u128::from_be_bytes(*counter);
+    *counter = value.wrapping_add(1).to_be_bytes();
+}
+
+fn increment_counter32(counter: &mut [u8; 16]) {
+    let value = u32::from_be_bytes(counter[12..].try_into().expect("counter suffix"));
+    counter[12..].copy_from_slice(&value.wrapping_add(1).to_be_bytes());
+}
+
+fn gcm_j0(nonce: &[u8]) -> [u8; 16] {
+    let mut counter = [0u8; 16];
+    counter[..12].copy_from_slice(nonce);
+    counter[15] = 1;
+    counter
+}
+
+fn stream_decrypt(
+    cipher: &dyn BlockCipher,
+    key: &[u8],
+    ciphertext: &[u8],
+    nonce: &[u8],
+    mode: CipherMode,
+) -> Option<Vec<u8>> {
+    let mut counter = match mode {
+        CipherMode::Ctr => nonce.try_into().ok()?,
+        CipherMode::Gcm => gcm_j0(nonce),
+        CipherMode::Block => return None,
+    };
+    if mode == CipherMode::Gcm {
+        increment_counter32(&mut counter);
+    }
+
+    let mut plaintext = Vec::with_capacity(ciphertext.len());
+    for chunk in ciphertext.chunks(16) {
+        let mut keystream = counter;
+        if !cipher.encrypt_with_key(key, &mut keystream) {
+            return None;
+        }
+        plaintext.extend(
+            chunk
+                .iter()
+                .zip(keystream)
+                .map(|(byte, key_byte)| byte ^ key_byte),
+        );
+        match mode {
+            CipherMode::Ctr => increment_counter(&mut counter),
+            CipherMode::Gcm => increment_counter32(&mut counter),
+            CipherMode::Block => return None,
+        }
+    }
+    Some(plaintext)
+}
+
+fn decrypt_gcm_tagged(
+    key: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8],
+    aad: &[u8],
+) -> Option<Vec<u8>> {
+    use aes_gcm::{
+        aead::{consts::U12, AeadInPlace, KeyInit},
+        AesGcm, Nonce, Tag,
+    };
+
+    let nonce = Nonce::<U12>::from_slice(nonce);
+    let tag = Tag::from_slice(tag);
+    let mut plaintext = ciphertext.to_vec();
+    let result = match key.len() {
+        16 => aes_gcm::Aes128Gcm::new_from_slice(key)
+            .ok()?
+            .decrypt_in_place_detached(nonce, aad, &mut plaintext, tag),
+        24 => AesGcm::<aes::Aes192, U12>::new_from_slice(key)
+            .ok()?
+            .decrypt_in_place_detached(nonce, aad, &mut plaintext, tag),
+        32 => aes_gcm::Aes256Gcm::new_from_slice(key)
+            .ok()?
+            .decrypt_in_place_detached(nonce, aad, &mut plaintext, tag),
+        _ => return None,
+    };
+    result.ok()?;
+    Some(plaintext)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hunt_stream(
+    dump: &[u8],
+    ciphertext: &[u8],
+    block: usize,
+    cipher: &dyn BlockCipher,
+    oracles: &[Box<dyn Oracle>],
+    config: &ScanConfig,
+    algo: &str,
+    tried: &AtomicU64,
+    stop: &AtomicBool,
+) -> Vec<Hit> {
+    let key_len = cipher.key_len();
+    let nonce = config.nonce.as_deref().unwrap_or_default();
+    let mode = match config.mode {
+        CipherMode::Ctr => Mode::Ctr,
+        CipherMode::Gcm => Mode::Gcm,
+        CipherMode::Block => return Vec::new(),
+    };
+    let verify_len = (VERIFY_BLOCKS * block).min(ciphertext.len());
+    let tag = config.tag.as_deref();
+    let aad = config.aad.as_deref().unwrap_or_default();
+
+    dump.par_windows(key_len)
+        .enumerate()
+        .filter(|_| !stop.load(Ordering::Relaxed))
+        .filter_map(|(offset, key)| {
+            tried.fetch_add(1, Ordering::Relaxed);
+
+            if config.mode == CipherMode::Gcm {
+                if let Some(tag) = tag {
+                    let plaintext = decrypt_gcm_tagged(key, nonce, ciphertext, tag, aad)?;
+                    return Some(finalize_stream_hit(
+                        algo,
+                        mode,
+                        key,
+                        offset,
+                        nonce,
+                        plaintext,
+                        "gcm-tag",
+                        Confidence::High,
+                    ));
+                }
+            }
+
+            let head = stream_decrypt(cipher, key, &ciphertext[..verify_len], nonce, config.mode)?;
+            let (name, confidence) = best_match(oracles, &head)?;
+            let plaintext = stream_decrypt(cipher, key, ciphertext, nonce, config.mode)?;
+            Some(finalize_stream_hit(
+                algo, mode, key, offset, nonce, plaintext, name, confidence,
+            ))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_stream_hit(
+    algo: &str,
+    mode: Mode,
+    key: &[u8],
+    key_offset: usize,
+    nonce: &[u8],
+    plaintext: Vec<u8>,
+    matched_by: &str,
+    confidence: Confidence,
+) -> Hit {
+    Hit {
+        algo: algo.to_string(),
+        mode,
+        key_hex: hex::encode(key),
+        key_offset,
+        iv_hex: None,
+        iv_offset: None,
+        nonce_hex: Some(hex::encode(nonce)),
+        padding: None,
+        plaintext_utf8: to_utf8(&plaintext),
+        plaintext_hex: hex::encode(plaintext),
+        matched_by: matched_by.to_string(),
+        confidence,
+        iv_candidates: Vec::new(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -512,6 +813,7 @@ fn finalize_hit(
         key_offset,
         iv_hex,
         iv_offset,
+        nonce_hex: None,
         padding,
         plaintext_utf8: to_utf8(plaintext),
         plaintext_hex: hex::encode(plaintext),
@@ -617,5 +919,140 @@ mod tests {
     fn rejects_non_block_ciphertext() {
         let dump = vec![0u8; 64];
         assert!(scan(&dump, &[0u8; 10], &oracles(), &ScanConfig::default()).is_err());
+    }
+
+    #[test]
+    fn parse_list_accepts_stream_tokens() {
+        let selection = CipherChoice::parse_list("aes-128-ctr").unwrap();
+        assert_eq!(selection.mode, CipherMode::Ctr);
+        assert_eq!(selection.ciphers, vec![CipherChoice::Aes128]);
+
+        let selection = CipherChoice::parse_list("aes-gcm").unwrap();
+        assert_eq!(selection.mode, CipherMode::Gcm);
+        assert_eq!(
+            selection.ciphers,
+            vec![
+                CipherChoice::Aes128,
+                CipherChoice::Aes192,
+                CipherChoice::Aes256
+            ]
+        );
+        assert!(CipherChoice::parse_list("aes-128-ctr,aes-128-gcm").is_err());
+    }
+
+    #[test]
+    fn nist_ctr_roundtrip() {
+        let nonce: [u8; 16] = [
+            0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd,
+            0xfe, 0xff,
+        ];
+        let ciphertext: [u8; 32] = [
+            0x87, 0x4d, 0x61, 0x91, 0xb6, 0x20, 0xe3, 0x26, 0x1b, 0xef, 0x68, 0x64, 0x99, 0x0d,
+            0xb6, 0xce, 0x98, 0x06, 0xf6, 0x6b, 0x79, 0x70, 0xfd, 0xff, 0x86, 0x17, 0x18, 0x7b,
+            0xb9, 0xff, 0xfd, 0xff,
+        ];
+        let expected: [u8; 32] = [
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a, 0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac,
+            0x45, 0xaf, 0x8e, 0x51,
+        ];
+        let cipher = crate::cipher_adapter::aes128();
+        let plaintext =
+            stream_decrypt(&cipher, &KEY128, &ciphertext, &nonce, CipherMode::Ctr).unwrap();
+        assert_eq!(plaintext, expected);
+    }
+
+    #[test]
+    fn gcm_aad_requires_tag() {
+        let dump = vec![0u8; 4096];
+        let config = ScanConfig {
+            ciphers: vec![CipherChoice::Aes128],
+            mode: CipherMode::Gcm,
+            nonce: Some(vec![0u8; 12]),
+            aad: Some(Vec::new()),
+            ..ScanConfig::default()
+        };
+        let error = scan(&dump, &[0u8; 16], &oracles(), &config).unwrap_err();
+        assert_eq!(error, "GCM aad requires a tag");
+    }
+
+    #[test]
+    fn nist_gcm_tag_verification() {
+        assert_eq!(
+            decrypt_gcm_tagged(
+                &[
+                    0xc9, 0x39, 0xcc, 0x13, 0x39, 0x7c, 0x1d, 0x37, 0xde, 0x6a, 0xe0, 0xe1, 0xcb,
+                    0x7c, 0x42, 0x3c,
+                ],
+                &[0xb3, 0xd8, 0xcc, 0x01, 0x7c, 0xbb, 0x89, 0xb3, 0x9e, 0x0f, 0x67, 0xe2,],
+                &[
+                    0x93, 0xfe, 0x7d, 0x9e, 0x9b, 0xfd, 0x10, 0x34, 0x8a, 0x56, 0x06, 0xe5, 0xca,
+                    0xfa, 0x73, 0x54,
+                ],
+                &[
+                    0x00, 0x32, 0xa1, 0xdc, 0x85, 0xf1, 0xc9, 0x78, 0x69, 0x25, 0xa2, 0xe7, 0x1d,
+                    0x82, 0x72, 0xdd,
+                ],
+                &[
+                    0x24, 0x82, 0x56, 0x02, 0xbd, 0x12, 0xa9, 0x84, 0xe0, 0x09, 0x2d, 0x3e, 0x44,
+                    0x8e, 0xda, 0x5f,
+                ],
+            ),
+            Some(
+                [
+                    0xc3, 0xb3, 0xc4, 0x1f, 0x11, 0x3a, 0x31, 0xb7, 0x3d, 0x9a, 0x5c, 0xd4, 0x32,
+                    0x10, 0x30, 0x69,
+                ]
+                .to_vec(),
+            )
+        );
+
+        assert_eq!(
+            decrypt_gcm_tagged(
+                &[
+                    0x92, 0xe1, 0x1d, 0xcd, 0xaa, 0x86, 0x6f, 0x5c, 0xe7, 0x90, 0xfd, 0x24, 0x50,
+                    0x1f, 0x92, 0x50, 0x9a, 0xac, 0xf4, 0xcb, 0x8b, 0x13, 0x39, 0xd5, 0x0c, 0x9c,
+                    0x12, 0x40, 0x93, 0x5d, 0xd0, 0x8b,
+                ],
+                &[0xac, 0x93, 0xa1, 0xa6, 0x14, 0x52, 0x99, 0xbd, 0xe9, 0x02, 0xf2, 0x1a,],
+                &[
+                    0x89, 0x95, 0xae, 0x2e, 0x6d, 0xf3, 0xdb, 0xf9, 0x6f, 0xac, 0x7b, 0x71, 0x37,
+                    0xba, 0xe6, 0x7f,
+                ],
+                &[
+                    0xec, 0xa5, 0xaa, 0x77, 0xd5, 0x1d, 0x4a, 0x0a, 0x14, 0xd9, 0xc5, 0x1e, 0x1d,
+                    0xa4, 0x74, 0xab,
+                ],
+                &[
+                    0x1e, 0x08, 0x89, 0x01, 0x6f, 0x67, 0x60, 0x1c, 0x8e, 0xbe, 0xa4, 0x94, 0x3b,
+                    0xc2, 0x3a, 0xd6,
+                ],
+            ),
+            Some(
+                [
+                    0x2d, 0x71, 0xbc, 0xfa, 0x91, 0x4e, 0x4a, 0xc0, 0x45, 0xb2, 0xaa, 0x60, 0x95,
+                    0x5f, 0xad, 0x24,
+                ]
+                .to_vec(),
+            )
+        );
+    }
+
+    #[test]
+    fn gcm_192_key_size_is_supported() {
+        use aes_gcm::aead::{consts::U12, AeadInPlace, KeyInit};
+
+        let key = [0x33u8; 24];
+        let nonce = [0x44u8; 12];
+        let plaintext = b"{\"aes\":192}".to_vec();
+        let mut ciphertext = plaintext.clone();
+        let cipher = aes_gcm::AesGcm::<aes::Aes192, U12>::new_from_slice(&key).unwrap();
+        let tag = cipher
+            .encrypt_in_place_detached(nonce.as_slice().into(), b"", &mut ciphertext)
+            .unwrap();
+        assert_eq!(
+            decrypt_gcm_tagged(&key, &nonce, &ciphertext, tag.as_slice(), b""),
+            Some(plaintext)
+        );
     }
 }

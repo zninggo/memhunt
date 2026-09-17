@@ -59,3 +59,43 @@ fn mcp_tool_errors_use_is_error() {
     assert_eq!(result["isError"], json!(true));
     let _ = std::fs::remove_file(dump);
 }
+
+#[test]
+fn mcp_gcm_tag_hit() {
+    use aes_gcm::aead::{AeadInPlace, KeyInit};
+
+    let key: [u8; 16] = [0x81u8; 16];
+    let nonce: [u8; 12] = [0x82u8; 12];
+    let plaintext = br#"{"client":"mcp","gcm":true}"#;
+    let key_offset = 2048;
+    let fixt_dir = std::env::temp_dir().join(format!("memhunt_mcptest_{}", std::process::id()));
+    std::fs::create_dir_all(&fixt_dir).unwrap();
+    let dump_path = fixt_dir.join("dump.bin");
+    let mut dump = vec![0x47u8; 4096];
+    dump[key_offset..key_offset + 16].copy_from_slice(&key);
+    std::fs::write(&dump_path, &dump).unwrap();
+
+    let cipher = aes_gcm::Aes128Gcm::new_from_slice(&key).unwrap();
+    let mut ciphertext = plaintext.to_vec();
+    let tag = cipher
+        .encrypt_in_place_detached(nonce.as_slice().into(), b"", &mut ciphertext)
+        .unwrap();
+
+    let result = call_memhunt_scan(json!({
+        "dump_path": dump_path,
+        "ciphertext": hex::encode(&ciphertext),
+        "ciphers": "aes-128-gcm",
+        "nonce": hex::encode(nonce),
+        "tag": hex::encode(tag),
+        "oracles": "json"
+    }));
+    assert_eq!(result["isError"], json!(false));
+    let payload: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    let hit = &payload["hits"][0];
+    assert_eq!(hit["mode"], json!("gcm"));
+    assert_eq!(hit["key_offset"], json!(key_offset));
+    assert_eq!(hit["nonce_hex"], json!(hex::encode(nonce)));
+    assert_eq!(hit["matched_by"], json!("gcm-tag"));
+    let _ = std::fs::remove_dir_all(fixt_dir);
+}

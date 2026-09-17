@@ -4,6 +4,7 @@
 //! These spawn the built binary (`CARGO_BIN_EXE_memhunt`) end-to-end so the
 //! documented exit codes are enforced against the real CLI, not just the lib.
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
+use serde_json::{json, Value};
 use std::process::Command;
 
 const KEY: [u8; 16] = [
@@ -83,4 +84,60 @@ fn exit_code_2_on_bad_encoding() {
         "utf8",
     );
     assert_eq!(out.status.code(), Some(2), "malformed target must exit 2");
+}
+
+#[test]
+fn cli_gcm_tag_hit() {
+    use aes_gcm::aead::{AeadInPlace, KeyInit};
+
+    let key: [u8; 16] = [0x71u8; 16];
+    let nonce: [u8; 12] = [0x72u8; 12];
+    let plaintext = br#"{"transport":"gcm","tag":true}"#;
+    let key_offset = 2048;
+
+    let fixt_dir = std::env::temp_dir().join(format!("memhunt_clitest_{}_gcm", std::process::id()));
+    std::fs::create_dir_all(&fixt_dir).unwrap();
+    let dump_path = fixt_dir.join("dump.bin");
+    let mut dump = vec![0x37u8; 4096];
+    dump[key_offset..key_offset + 16].copy_from_slice(&key);
+    std::fs::write(&dump_path, &dump).unwrap();
+
+    let cipher = aes_gcm::Aes128Gcm::new_from_slice(&key).unwrap();
+    let mut ciphertext = plaintext.to_vec();
+    let tag = cipher
+        .encrypt_in_place_detached(nonce.as_slice().into(), b"", &mut ciphertext)
+        .unwrap();
+
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dump_path.to_str().unwrap(),
+            "--target",
+            &hex::encode(&ciphertext),
+            "--cipher",
+            "aes-128-gcm",
+            "--nonce",
+            &hex::encode(nonce),
+            "--tag",
+            &hex::encode(tag),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hit: Value = serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(hit["mode"], json!("gcm"));
+    assert_eq!(hit["algo"], json!("aes-128"));
+    assert_eq!(hit["key_offset"], json!(key_offset));
+    assert_eq!(hit["nonce_hex"], json!(hex::encode(nonce)));
+    assert_eq!(hit["matched_by"], json!("gcm-tag"));
+    assert_eq!(hit["padding"], Value::Null);
+    let _ = std::fs::remove_dir_all(fixt_dir);
 }

@@ -35,7 +35,7 @@ enum Command {
         oracle: String,
 
         /// Cipher families to try: aes-128, aes-192, aes-256, des, 3des, sm4,
-        /// aes (= all sizes), all.
+        /// aes (= all sizes), all, or AES with -ctr/-gcm suffix.
         #[arg(long, value_delimiter = ',', default_value = "aes")]
         cipher: String,
 
@@ -46,6 +46,18 @@ enum Command {
         /// Fixed IV (hex) for CBC; enables single-block ciphertext scans.
         #[arg(long)]
         iv: Option<String>,
+
+        /// CTR initial counter block or GCM nonce (hex).
+        #[arg(long)]
+        nonce: Option<String>,
+
+        /// GCM authentication tag (hex).
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// GCM additional authenticated data (hex).
+        #[arg(long)]
+        aad: Option<String>,
 
         /// Disable the IV scan pass after a CBC hit.
         #[arg(long)]
@@ -157,6 +169,9 @@ fn print_human(out: &mut impl Write, hit: &memhunt_core::Hit) {
             .unwrap_or_else(|| "fixed".into());
         let _ = writeln!(out, "       iv ={} {}", off, iv);
     }
+    if let Some(nonce) = &hit.nonce_hex {
+        let _ = writeln!(out, "       nonce ={nonce}");
+    }
     for (i, c) in hit.iv_candidates.iter().enumerate() {
         let preview = c
             .block0_utf8
@@ -196,6 +211,9 @@ fn main() -> ExitCode {
             cipher,
             max_hits,
             iv,
+            nonce,
+            tag,
+            aad,
             no_iv_scan,
             json,
             threads,
@@ -207,6 +225,9 @@ fn main() -> ExitCode {
             &cipher,
             max_hits,
             iv,
+            nonce,
+            tag,
+            aad,
             !no_iv_scan,
             json,
             threads,
@@ -244,6 +265,9 @@ fn run_scan(
     cipher_spec: &str,
     max_hits: usize,
     iv: Option<String>,
+    nonce: Option<String>,
+    tag: Option<String>,
+    aad: Option<String>,
     scan_iv: bool,
     json: bool,
     threads: Option<usize>,
@@ -258,26 +282,38 @@ fn run_scan(
 
         let ciphertext = decode_ciphertext(target, encoding)?;
         let oracles: Vec<Box<dyn Oracle>> = memhunt_core::oracle::parse_spec(oracle)?;
-        let ciphers = CipherChoice::parse_list(cipher_spec)?;
-        let fixed_iv = match &iv {
-            Some(h) => Some(hex::decode(h).map_err(|_| "invalid --iv hex")?),
-            None => None,
+        let selection = CipherChoice::parse_list(cipher_spec)?;
+        let decode_hex_arg = |value: &Option<String>, name: &str| {
+            value
+                .as_deref()
+                .map(hex::decode)
+                .transpose()
+                .map_err(|_| format!("invalid --{name} hex"))
         };
+        let fixed_iv = decode_hex_arg(&iv, "iv")?;
+        let nonce = decode_hex_arg(&nonce, "nonce")?;
+        let tag = decode_hex_arg(&tag, "tag")?;
+        let aad = decode_hex_arg(&aad, "aad")?;
         let config = ScanConfig {
-            ciphers,
+            ciphers: selection.ciphers,
+            mode: selection.mode,
             max_hits,
             scan_iv,
             fixed_iv,
+            nonce,
+            tag,
+            aad,
         };
 
         let dump_bytes = std::fs::read(dump_path).map_err(|e| format!("read {dump_path}: {e}"))?;
         eprintln!(
-            "memhunt: dump={} ({:.1} MiB), ciphertext={} bytes, oracles=[{}], ciphers={}",
+            "memhunt: dump={} ({:.1} MiB), ciphertext={} bytes, oracles=[{}], ciphers={}, mode={:?}",
             dump_path,
             dump_bytes.len() as f64 / (1024.0 * 1024.0),
             ciphertext.len(),
             oracle,
-            cipher_spec
+            cipher_spec,
+            config.mode
         );
 
         let result = scan(&dump_bytes, &ciphertext, &oracles, &config)?;

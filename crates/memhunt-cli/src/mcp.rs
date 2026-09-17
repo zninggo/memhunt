@@ -21,16 +21,19 @@ fn tools_schema() -> Value {
     json!([
         {
             "name": "memhunt_scan",
-            "description": "Hunt block-cipher keys in a memory dump given a known ciphertext. Slides a window over every dump offset, tries each window as a key (AES-128/192/256, DES, 3DES, SM4), and validates decryptions against oracles. CBC keys are verified IV-independently; the IV is located in a second pass.",
+            "description": "Hunt block-cipher keys in a memory dump given a known ciphertext. Supports ECB/CBC for AES, DES, 3DES, and SM4, plus AES-CTR/GCM with an explicit nonce. GCM with a tag is verified deterministically without an oracle.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "dump_path": {"type": "string", "description": "Path to the raw memory dump."},
                     "ciphertext": {"type": "string", "description": "Target ciphertext (hex or base64)."},
-                    "ciphers": {"type": "string", "description": "Comma list: aes-128, aes-192, aes-256, des, 3des, sm4, aes (=all sizes), all. Default aes."},
+                    "ciphers": {"type": "string", "description": "Comma list: aes-128, aes-192, aes-256, des, 3des, sm4, aes (=all sizes), all, or AES tokens with -ctr/-gcm suffix. Default aes."},
                     "oracles": {"type": "string", "description": "Comma list: utf8, json, gzip, protobuf, known:<fragment>. Default utf8,json."},
                     "max_hits": {"type": "integer", "description": "Stop after N hits (0 = unlimited)."},
                     "iv": {"type": "string", "description": "Fixed IV (hex) for CBC; enables single-block ciphertext scans."},
+                    "nonce": {"type": "string", "description": "CTR 16-byte initial counter block or GCM 12-byte nonce (hex). Required for CTR/GCM."},
+                    "tag": {"type": "string", "description": "GCM 16-byte authentication tag (hex). Enables deterministic key verification."},
+                    "aad": {"type": "string", "description": "GCM additional authenticated data (hex)."},
                     "threads": {"type": "integer", "description": "Worker threads (default all cores)."}
                 },
                 "required": ["dump_path", "ciphertext"]
@@ -83,7 +86,7 @@ fn tool_scan(args: &Value) -> Result<Value, String> {
     let dump = std::fs::read(dump_path).map_err(|e| format!("read {dump_path}: {e}"))?;
     let ciphertext = decode_blob(ciphertext_s)?;
 
-    let ciphers = match args.get("ciphers").and_then(Value::as_str) {
+    let selection = match args.get("ciphers").and_then(Value::as_str) {
         Some(s) => CipherChoice::parse_list(s)?,
         None => CipherChoice::parse_list("aes")?,
     };
@@ -92,10 +95,18 @@ fn tool_scan(args: &Value) -> Result<Value, String> {
         None => build_oracles("utf8,json")?,
     };
     let max_hits = args.get("max_hits").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let fixed_iv = match args.get("iv").and_then(Value::as_str) {
-        Some(h) => Some(hex::decode(h).map_err(|_| "invalid iv hex")?),
-        None => None,
+    let decode_hex_arg = |name: &str| -> Result<Option<Vec<u8>>, String> {
+        match args.get(name).and_then(Value::as_str) {
+            Some(value) => hex::decode(value)
+                .map(Some)
+                .map_err(|_| format!("invalid {name} hex")),
+            None => Ok(None),
+        }
     };
+    let fixed_iv = decode_hex_arg("iv")?;
+    let nonce = decode_hex_arg("nonce")?;
+    let tag = decode_hex_arg("tag")?;
+    let aad = decode_hex_arg("aad")?;
     if let Some(n) = args.get("threads").and_then(Value::as_u64) {
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(n as usize)
@@ -103,10 +114,14 @@ fn tool_scan(args: &Value) -> Result<Value, String> {
     }
 
     let config = ScanConfig {
-        ciphers,
+        ciphers: selection.ciphers,
+        mode: selection.mode,
         max_hits,
         scan_iv: true,
         fixed_iv,
+        nonce,
+        tag,
+        aad,
     };
     let result = scan(&dump, &ciphertext, &oracles, &config)?;
     serde_json::to_value(&result).map_err(|e| e.to_string())

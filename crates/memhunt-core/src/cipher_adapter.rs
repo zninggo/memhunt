@@ -7,7 +7,7 @@
 //! once per (crate, version) pair. The engine only ever sees this trait, so
 //! new ciphers — whatever array ecosystem they live in — plug in with one impl.
 
-use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
+use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
 
 /// A block cipher that can be keyed from raw bytes and decrypt single blocks,
 /// independent of which `cipher` crate version it originates from.
@@ -21,6 +21,9 @@ pub trait BlockCipher: Sync + Send {
     /// Re-key with `key` (exactly `key_len` bytes) and decrypt `block`
     /// in place. Returns false when the key is rejected.
     fn decrypt_with_key(&self, key: &[u8], block: &mut [u8]) -> bool;
+    /// Re-key with `key` (exactly `key_len` bytes) and encrypt `block`
+    /// in place. Returns false when the key is rejected.
+    fn encrypt_with_key(&self, key: &[u8], block: &mut [u8]) -> bool;
 }
 
 /// Cipher 0.4 family (`aes 0.8`): 16-byte blocks, GenericArray-based.
@@ -40,7 +43,7 @@ impl<C> AesAdapter<C> {
     }
 }
 
-impl<C: KeyInit + BlockDecrypt + Sync + Send> BlockCipher for AesAdapter<C> {
+impl<C: KeyInit + BlockDecrypt + BlockEncrypt + Sync + Send> BlockCipher for AesAdapter<C> {
     fn algo(&self) -> &'static str {
         self.algo
     }
@@ -58,6 +61,17 @@ impl<C: KeyInit + BlockDecrypt + Sync + Send> BlockCipher for AesAdapter<C> {
             return false;
         };
         cipher.decrypt_block(GenericArray::from_mut_slice(b));
+        true
+    }
+
+    fn encrypt_with_key(&self, key: &[u8], block: &mut [u8]) -> bool {
+        let Ok(cipher) = C::new_from_slice(key) else {
+            return false;
+        };
+        let Some(b) = block.get_mut(..16) else {
+            return false;
+        };
+        cipher.encrypt_block(GenericArray::from_mut_slice(b));
         true
     }
 }
@@ -96,7 +110,11 @@ impl<C> Cipher05Adapter<C> {
 
 impl<C> BlockCipher for Cipher05Adapter<C>
 where
-    C: sm4::cipher::KeyInit + sm4::cipher::BlockCipherDecrypt + Sync + Send,
+    C: sm4::cipher::KeyInit
+        + sm4::cipher::BlockCipherDecrypt
+        + sm4::cipher::BlockCipherEncrypt
+        + Sync
+        + Send,
 {
     fn algo(&self) -> &'static str {
         self.algo
@@ -119,6 +137,20 @@ where
             return false;
         };
         cipher.decrypt_block(buf);
+        true
+    }
+
+    fn encrypt_with_key(&self, key: &[u8], block: &mut [u8]) -> bool {
+        let Ok(cipher) = C::new_from_slice(key) else {
+            return false;
+        };
+        let Some(b) = block.get_mut(..self.block_len) else {
+            return false;
+        };
+        let Ok(buf) = <&mut sm4::cipher::Array<u8, C::BlockSize>>::try_from(b) else {
+            return false;
+        };
+        cipher.encrypt_block(buf);
         true
     }
 }

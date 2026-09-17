@@ -20,4 +20,5 @@ serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
 aes = "0.8"
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes"] }
 hex = "0.4"

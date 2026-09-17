@@ -23,6 +23,8 @@ impl Confidence {
 pub enum Mode {
     Ecb,
     Cbc,
+    Ctr,
+    Gcm,
 }
 
 /// One plausible IV location found by the IV scan pass.
@@ -50,6 +52,7 @@ pub struct Hit {
     pub key_offset: usize,
     pub iv_hex: Option<String>,
     pub iv_offset: Option<usize>,
+    pub nonce_hex: Option<String>,
     pub padding: Option<String>,
     pub plaintext_utf8: Option<String>,
     pub plaintext_hex: String,

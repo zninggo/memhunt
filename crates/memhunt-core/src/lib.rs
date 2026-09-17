@@ -18,7 +18,7 @@ pub mod oracle;
 pub mod report;
 
 pub use cipher_adapter::BlockCipher;
-pub use engine::{scan, CipherChoice, ScanConfig};
+pub use engine::{scan, CipherChoice, CipherMode, CipherSelection, ScanConfig};
 pub use hash_scan::{
     scan_hmac_keys, scan_preimages, HashAlgoSpec, HashScanConfig, HashScanResult, LengthRange,
 };

@@ -19,6 +19,7 @@ sha2 = "0.11.0"
 sm3 = "0.5.0"
 hmac = "0.13.0"
 digest = "0.11"
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes"] }
 
 [dev-dependencies]
 base64 = "0.22"

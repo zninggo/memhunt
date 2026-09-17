@@ -18,7 +18,7 @@ technique of detecting AES expanded key schedules.
 
 | Mode | Artifact you have | What it finds |
 |---|---|---|
-| `scan` | a known ciphertext | the block-cipher key (AES-128/192/256, DES, 3DES-EDE3, SM4) — ECB & CBC |
+| `scan` | a known ciphertext | the cipher key (AES-128/192/256 ECB/CBC/CTR/GCM, DES, 3DES-EDE3, SM4 ECB/CBC) |
 | `hash` | a digest (MD5/SHA-1/SHA-256/SM3) | the hashed bytes still resident in the dump |
 | `hash --mode hmac_key` | a MAC + the signed message | the HMAC secret key |
 | `key-schedules` | a dump, nothing else | expanded AES key schedules (key = schedule head) |
@@ -54,12 +54,30 @@ memhunt scan app_dump.bin --target <ciphertext> --oracle known:password,utf8
 # Known IV (enables single-block CBC scans)
 memhunt scan app_dump.bin --target <ciphertext> --iv 000102...0f
 
+# AES-CTR with a known 16-byte initial counter block
+memhunt scan app_dump.bin --target <ciphertext> \
+    --cipher aes-128-ctr --nonce f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff
+
+# AES-GCM with a 12-byte nonce and authentication tag (zero false positives)
+memhunt scan app_dump.bin --target <ciphertext> \
+    --cipher aes-256-gcm --nonce cafebabefacedbaddecaf888 \
+    --tag 4d5c2af327cd64a62cf35abd2ba6fab4
+
+# AES-GCM without a tag falls back to keystream decryption plus oracles
+memhunt scan app_dump.bin --target <ciphertext> \
+    --cipher aes-256-gcm --nonce cafebabefacedbaddecaf888 --oracle json
+
 # JSON Lines output for scripting / AI agents
 memhunt scan app_dump.bin --target <ciphertext> --json
 ```
 
 `--cipher` accepts a comma-separated list: `aes-128`, `aes-192`, `aes-256`,
-`des`, `3des`, `sm4`, `aes` (= all three AES sizes), or `all`.
+`des`, `3des`, `sm4`, `aes` (= all three AES sizes), or `all`. AES tokens may
+also use a `-ctr` or `-gcm` suffix, such as `aes-128-ctr` or `aes-gcm`. CTR
+requires a 16-byte initial counter block in `--nonce`; GCM requires a 12-byte
+nonce. GCM accepts optional `--tag` (16 bytes) and `--aad` (hex). A tagged GCM
+scan verifies keys cryptographically and needs no oracle; without a tag it uses
+the configured oracles. All tokens in one list must select the same mode.
 
 Output goes to stdout, progress and stats to stderr. Exit codes: `0` hit
 found, `1` no hit, `2` error.
@@ -119,10 +137,15 @@ Two ideas make the ciphertext path practical:
    ranking candidates by oracle confidence.
 
 Only the first two ciphertext blocks are decrypted during candidate
-validation; full decrypt and padding strip run once per hit. Scan with `rayon`
-across all cores and AES-NI when available. DES/3DES (8-byte blocks) and SM4
-(16-byte blocks) ride the same generic engine through a small
-version-bridging adapter.
+validation; full decrypt and padding strip run once per hit. CTR and GCM use
+the same two-block limit for oracle validation, then fully decrypt on a hit;
+streaming ciphertexts do not need block alignment. GCM keystream blocks start
+at `inc32(J0)`, where `J0 = nonce || 0^31 || 1`; the authentication tag uses
+`J0` itself. When a GCM tag is supplied, memhunt verifies the complete
+ciphertext/tag pair with RustCrypto `aes-gcm`, yielding a deterministic High
+confidence hit with no oracle. Scan with `rayon` across all cores and AES-NI
+when available. DES/3DES (8-byte blocks) and SM4 (16-byte blocks) ride the same
+generic engine through a small version-bridging adapter.
 
 ### IV candidates
 
@@ -138,8 +161,8 @@ unique one.
 
 - Only the first two ciphertext blocks (`VERIFY_BLOCKS = 2`) are consulted to
   validate a candidate key.
-- Ciphertext must be a multiple of the cipher's block size (16 for AES/SM4,
-  8 for DES/3DES).
+- ECB/CBC ciphertext must be a multiple of the cipher's block size (16 for
+  AES/SM4, 8 for DES/3DES); CTR/GCM ciphertext may be any non-empty length.
 - Single-block CBC scans need a fixed `--iv`.
 - Preimage/HMAC windows scan lengths in `--min-len..=--max-len` (default
   8..=128) plus fixed 16/24/32/64-byte HMAC keys.
@@ -171,7 +194,9 @@ Requires `openssl`; Python 3.8+ stdlib only. Exits non-zero on any failure.
 - [x] gzip / protobuf magic oracles
 - [x] MCP server mode for AI-agent integration
 - [ ] Rijndael-256 / Camellia / ChaCha20 (stream cipher key searches)
-- [ ] CFB / OFB / CTR mode verification
+- [ ] CFB / OFB mode verification
+- [x] CTR mode verification
+- [x] AES-GCM mode verification (tag and oracle paths)
 - [ ] Runtime maps (map hits back to allocations)
 
 ## License

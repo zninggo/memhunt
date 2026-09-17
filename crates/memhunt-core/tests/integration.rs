@@ -1,9 +1,20 @@
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
-use memhunt_core::{scan, JsonOracle, Oracle, ScanConfig, Utf8Oracle};
+use memhunt_core::{scan, CipherChoice, CipherMode, JsonOracle, Oracle, ScanConfig, Utf8Oracle};
 use std::time::Instant;
 
 const KEY: [u8; 16] = [
     0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+];
+const KEY256: [u8; 32] = [
+    0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+    0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40,
+];
+const CTR_COUNTER: [u8; 16] = [
+    0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
+];
+const GCM_AAD: &[u8] = b"memhunt-aad";
+const GCM_NONCE: [u8; 12] = [
+    0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b,
 ];
 const IV: [u8; 16] = [
     0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f,
@@ -91,6 +102,53 @@ fn dump_with_key_and_iv_offsets(size: usize, key_off: usize, iv_off: usize) -> V
     let mut dump = make_dump_size(size);
     dump[key_off..key_off + 16].copy_from_slice(&KEY);
     dump[iv_off..iv_off + 16].copy_from_slice(&IV);
+    dump
+}
+
+fn encrypt_ctr(plaintext: &[u8]) -> Vec<u8> {
+    let cipher = aes::Aes128::new_from_slice(&KEY).unwrap();
+    let mut counter = CTR_COUNTER;
+    plaintext
+        .chunks(16)
+        .flat_map(|chunk| {
+            let mut keystream = counter;
+            cipher.encrypt_block(GenericArray::from_mut_slice(&mut keystream));
+            let value = u128::from_be_bytes(counter);
+            counter = value.wrapping_add(1).to_be_bytes();
+            chunk
+                .iter()
+                .zip(keystream)
+                .map(|(byte, key)| byte ^ key)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn encrypt_gcm_128(plaintext: &[u8]) -> (Vec<u8>, [u8; 16]) {
+    use aes_gcm::aead::{AeadInPlace, KeyInit};
+
+    let cipher = aes_gcm::Aes128Gcm::new_from_slice(&KEY).unwrap();
+    let mut ciphertext = plaintext.to_vec();
+    let tag = cipher
+        .encrypt_in_place_detached(GCM_NONCE.as_slice().into(), b"", &mut ciphertext)
+        .unwrap();
+    (ciphertext, tag.as_slice().try_into().unwrap())
+}
+
+fn encrypt_gcm_256(plaintext: &[u8], aad: &[u8]) -> (Vec<u8>, [u8; 16]) {
+    use aes_gcm::aead::{AeadInPlace, KeyInit};
+
+    let cipher = aes_gcm::Aes256Gcm::new_from_slice(&KEY256).unwrap();
+    let mut ciphertext = plaintext.to_vec();
+    let tag = cipher
+        .encrypt_in_place_detached(GCM_NONCE.as_slice().into(), aad, &mut ciphertext)
+        .unwrap();
+    (ciphertext, tag.as_slice().try_into().unwrap())
+}
+
+fn dump_with_key(key: &[u8], offset: usize) -> Vec<u8> {
+    let mut dump = make_dump_size(64 * 1024);
+    dump[offset..offset + key.len()].copy_from_slice(key);
     dump
 }
 
@@ -351,4 +409,112 @@ fn des_cbc_end_to_end() {
         Some(iv_off),
         "IV must be pinned by json oracle"
     );
+}
+
+#[test]
+fn end_to_end_ctr_hit() {
+    let key_offset = 30_000;
+    let dump = dump_with_key(&KEY, key_offset);
+    let ciphertext = encrypt_ctr(PLAINTEXT);
+    let config = ScanConfig {
+        ciphers: vec![CipherChoice::Aes128],
+        mode: CipherMode::Ctr,
+        nonce: Some(CTR_COUNTER.to_vec()),
+        ..ScanConfig::default()
+    };
+
+    let result = scan(&dump, &ciphertext, &oracles(), &config).unwrap();
+    let hit = result
+        .hits
+        .iter()
+        .find(|h| h.key_offset == key_offset && h.mode == memhunt_core::Mode::Ctr)
+        .expect("expected CTR hit at planted key");
+    assert_eq!(hit.algo, "aes-128");
+    assert_eq!(
+        hit.nonce_hex.as_deref(),
+        Some(hex::encode(CTR_COUNTER).as_str())
+    );
+    assert_eq!(hit.padding, None);
+    assert_eq!(
+        hit.plaintext_utf8.as_deref(),
+        Some(std::str::from_utf8(PLAINTEXT).unwrap())
+    );
+}
+
+#[test]
+fn end_to_end_gcm_hit_with_tag() {
+    let key_offset = 30_100;
+    let dump = dump_with_key(&KEY256, key_offset);
+    let (ciphertext, tag) = encrypt_gcm_256(PLAINTEXT, GCM_AAD);
+    let config = ScanConfig {
+        ciphers: vec![CipherChoice::Aes256],
+        mode: CipherMode::Gcm,
+        nonce: Some(GCM_NONCE.to_vec()),
+        tag: Some(tag.to_vec()),
+        aad: Some(GCM_AAD.to_vec()),
+        ..ScanConfig::default()
+    };
+
+    let result = scan(&dump, &ciphertext, &Vec::new(), &config).unwrap();
+    let hit = result
+        .hits
+        .iter()
+        .find(|h| h.key_offset == key_offset && h.mode == memhunt_core::Mode::Gcm)
+        .expect("expected GCM hit at planted key");
+    assert_eq!(hit.algo, "aes-256");
+    assert_eq!(hit.matched_by, "gcm-tag");
+    assert_eq!(hit.confidence, memhunt_core::Confidence::High);
+    assert_eq!(
+        hit.nonce_hex.as_deref(),
+        Some(hex::encode(GCM_NONCE).as_str())
+    );
+    assert_eq!(hit.padding, None);
+    assert_eq!(
+        hit.plaintext_utf8.as_deref(),
+        Some(std::str::from_utf8(PLAINTEXT).unwrap())
+    );
+}
+
+#[test]
+fn end_to_end_gcm_hit_without_tag_uses_oracle() {
+    let key_offset = 30_200;
+    let dump = dump_with_key(&KEY, key_offset);
+    let (ciphertext, _) = encrypt_gcm_128(PLAINTEXT);
+    let config = ScanConfig {
+        ciphers: vec![CipherChoice::Aes128],
+        mode: CipherMode::Gcm,
+        nonce: Some(GCM_NONCE.to_vec()),
+        ..ScanConfig::default()
+    };
+
+    let result = scan(&dump, &ciphertext, &oracles(), &config).unwrap();
+    let hit = result
+        .hits
+        .iter()
+        .find(|h| h.key_offset == key_offset && h.mode == memhunt_core::Mode::Gcm)
+        .expect("expected GCM oracle hit at planted key");
+    assert_eq!(hit.matched_by, "json");
+    assert_eq!(hit.confidence, memhunt_core::Confidence::High);
+    assert_eq!(hit.padding, None);
+    assert_eq!(
+        hit.plaintext_utf8.as_deref(),
+        Some(std::str::from_utf8(PLAINTEXT).unwrap())
+    );
+}
+
+#[test]
+fn gcm_random_data_with_tag_yields_no_hits() {
+    let dump = make_dump_size(4096);
+    let ciphertext = [0x77u8; 67];
+    let tag = [0x88u8; 16];
+    let config = ScanConfig {
+        ciphers: vec![CipherChoice::Aes128],
+        mode: CipherMode::Gcm,
+        nonce: Some(GCM_NONCE.to_vec()),
+        tag: Some(tag.to_vec()),
+        ..ScanConfig::default()
+    };
+
+    let result = scan(&dump, &ciphertext, &Vec::new(), &config).unwrap();
+    assert!(result.hits.is_empty(), "unexpected hits: {:?}", result.hits);
 }
