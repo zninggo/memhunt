@@ -118,8 +118,38 @@ memhunt serve
 ```
 
 Speaks Model Context Protocol over stdio (JSON-RPC 2.0, newline-delimited).
-Exposes the tools `memhunt_scan`, `memhunt_key_schedules`, `memhunt_hash_scan`.
-Point any MCP client at `memhunt serve`.
+Exposes the tools `memhunt_scan`, `memhunt_key_schedules`, and
+`memhunt_hash_scan`. Point any MCP client at `memhunt serve`.
+
+For Codex, add the server to `~/.codex/config.toml` using an absolute binary
+path, then restart the client and run `/mcp`:
+
+```toml
+[mcp_servers.memhunt]
+command = "/absolute/path/to/memhunt"
+args = ["serve"]
+startup_timeout_sec = 20
+tool_timeout_sec = 600
+```
+
+The model can then choose a tool from a natural-language request. For example,
+an AES-256-GCM key hunt sends:
+
+```json
+{
+  "dump_path": "/path/to/process.dump",
+  "ciphertext": "<hex-or-base64>",
+  "ciphers": "aes-256-gcm",
+  "nonce": "<12-byte-hex>",
+  "tag": "<16-byte-hex>",
+  "oracles": "json"
+}
+```
+
+`memhunt_key_schedules` takes only `dump_path`; `memhunt_hash_scan` takes
+`dump_path`, `mode`, `digest`, and optionally `algos`, `message`, `min_len`,
+and `max_len`. Tool execution failures are returned as MCP results with
+`isError: true`.
 
 ## How it works
 
