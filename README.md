@@ -100,6 +100,20 @@ original Python implementation.
 Any raw process/core dump works: `procdump`, `gcore`, `frida-dump`, or a
 custom `ptrace`/`ReadProcessMemory` script. memhunt only needs raw bytes.
 
+## Regression harness
+
+`scripts/repro_regression.py` rebuilds the v0.1.0 handover bug scenarios
+(exit-code contract, utf8-only IV ambiguity, `known:` fragment in a later
+block, default-oracle IV pinning) against a deterministic dump and asserts
+the fixed behavior end-to-end against the built binary:
+
+```sh
+cargo build --release
+./scripts/repro_regression.py            # or pass a binary path explicitly
+```
+
+Requires `openssl`; Python 3.8+ stdlib only. Exits non-zero on any failure.
+
 ## Roadmap
 
 - [ ] DES / 3DES / SM4, hash and HMAC matching (md5/sha1/sha256/sm3)
