@@ -26,7 +26,7 @@ jobs:
             archive: tar.gz
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -58,7 +58,7 @@ jobs:
           New-Item -ItemType Directory $Stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/memhunt.exe", README.md, LICENSE $Stage
           Compress-Archive -Path $Stage -DestinationPath "$Stage.zip"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: memhunt-${{ matrix.target }}
           path: memhunt-*.${{ matrix.archive }}
@@ -70,7 +70,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: memhunt-*
           merge-multiple: true
