@@ -149,7 +149,7 @@ fn end_to_end_single_block_cbc_with_fixed_iv() {
     assert_eq!(ciphertext.len(), 16);
 
     let config = ScanConfig {
-        fixed_iv: Some(IV),
+        fixed_iv: Some(IV.to_vec()),
         ..ScanConfig::default()
     };
     let result = scan(&dump, &ciphertext, &oracles(), &config).unwrap();
@@ -256,5 +256,99 @@ fn throughput_smoke_1mib() {
         SMOKE_DUMP_SIZE as f64 / (1024.0 * 1024.0),
         secs,
         SMOKE_DUMP_SIZE as f64 / (1024.0 * 1024.0) / secs
+    );
+}
+
+#[test]
+fn sm4_cbc_end_to_end() {
+    use sm4::cipher::{BlockCipherEncrypt, KeyInit};
+    let sm4_key: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10,
+    ];
+    let sm4_iv: [u8; 16] = [0xa0; 16];
+    // >= 48 bytes of JSON: the verified head (blocks 1..2 = bytes 16..47)
+    // is a contiguous clean-JSON region for the json oracle to validate,
+    // so the unique IV is pinned without padding noise in the tail.
+    let pt = b"{\"user\":\"admin\",\"role\":\"sm4-test\",\"ok\":true,\"n\":1}";
+    assert!(pt.len() > 32);
+    let padded = pkcs7(pt);
+    let cipher = sm4::Sm4::new_from_slice(&sm4_key).unwrap();
+    let mut prev = sm4_iv;
+    let mut ct: Vec<u8> = Vec::new();
+    for c in padded.as_chunks::<16>().0 {
+        let mut b: [u8; 16] = *c;
+        for j in 0..16 {
+            b[j] ^= prev[j];
+        }
+        cipher.encrypt_block((&mut b).into());
+        prev = b;
+        ct.extend_from_slice(&b);
+    }
+
+    let mut dump = make_dump();
+    let key_off = 120_000;
+    let iv_off = 120_100;
+    dump[key_off..key_off + 16].copy_from_slice(&sm4_key);
+    dump[iv_off..iv_off + 16].copy_from_slice(&sm4_iv);
+
+    let config = ScanConfig {
+        ciphers: vec![memhunt_core::CipherChoice::Sm4],
+        ..ScanConfig::default()
+    };
+    let result = scan(&dump, &ct, &oracles(), &config).unwrap();
+    let hit = result
+        .hits
+        .iter()
+        .find(|h| h.key_offset == key_off && h.mode == memhunt_core::Mode::Cbc)
+        .expect("expected SM4 CBC hit at planted key");
+    assert_eq!(hit.algo, "sm4");
+    assert_eq!(hit.iv_offset, Some(iv_off));
+    assert_eq!(
+        hit.plaintext_utf8.as_deref(),
+        Some(std::str::from_utf8(pt).unwrap())
+    );
+}
+
+#[test]
+fn des_cbc_end_to_end() {
+    use des::cipher::{BlockCipherEncrypt, KeyInit};
+    let key: [u8; 8] = [0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37];
+    let iv: [u8; 8] = [0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f];
+    let pt = b"{\"user\":\"admin\"}"; // 16 bytes = 2 DES blocks, JSON so iv pins
+    let cipher = des::Des::new_from_slice(&key).unwrap();
+    let mut prev = iv;
+    let mut ct: Vec<u8> = Vec::new();
+    for c in pt.as_chunks::<8>().0 {
+        let mut b: [u8; 8] = *c;
+        for j in 0..8 {
+            b[j] ^= prev[j];
+        }
+        cipher.encrypt_block((&mut b).into());
+        prev = b;
+        ct.extend_from_slice(&b);
+    }
+
+    let mut dump = make_dump();
+    let key_off = 130_000;
+    let iv_off = 130_100;
+    dump[key_off..key_off + 8].copy_from_slice(&key);
+    dump[iv_off..iv_off + 8].copy_from_slice(&iv);
+
+    let config = ScanConfig {
+        ciphers: vec![memhunt_core::CipherChoice::Des],
+        ..ScanConfig::default()
+    };
+    let result = scan(&dump, &ct, &oracles(), &config).unwrap();
+    let hit = result
+        .hits
+        .iter()
+        .find(|h| h.key_offset == key_off && h.mode == memhunt_core::Mode::Cbc)
+        .expect("expected DES CBC hit at planted key");
+    assert_eq!(hit.algo, "des");
+    assert_eq!(
+        hit.iv_offset,
+        Some(iv_off),
+        "IV must be pinned by json oracle"
     );
 }

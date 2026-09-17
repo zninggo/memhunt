@@ -57,7 +57,7 @@ def openssl_cbc(pt, key, iv):
 def run(binary, dump, ct_hex, oracle, extra=()):
     p = subprocess.run(
         [binary, "scan", dump, "--target", ct_hex, "--oracle", oracle,
-         "--key-size", "128", *extra],
+         "--cipher", "aes-128", *extra],
         capture_output=True, text=True)
     return p.returncode, p.stdout, p.stderr
 

@@ -69,6 +69,7 @@ pub struct ScanStats {
     pub candidates_per_sec: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
 pub struct ScanResult {
     pub hits: Vec<Hit>,
     pub stats: ScanStats,

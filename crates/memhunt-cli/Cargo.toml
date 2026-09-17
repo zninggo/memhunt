@@ -3,7 +3,7 @@ name = "memhunt-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Hunt AES keys and IVs in memory dumps from a known ciphertext (CLI)"
+description = "Hunt AES/DES/3DES/SM4 keys, hash preimages, HMAC secrets, and key schedules in memory dumps from a known ciphertext (CLI)"
 
 [[bin]]
 name = "memhunt"
@@ -16,6 +16,7 @@ serde_json = "1"
 base64 = "0.22"
 hex = "0.4"
 rayon = "1"
+serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
 aes = "0.8"

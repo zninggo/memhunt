@@ -94,12 +94,130 @@ impl Oracle for KnownPlaintextOracle {
     }
 }
 
+/// Plaintext starts with the gzip magic bytes `1f 8b 08` (deflate stream).
+///
+/// Compressed request bodies are a common plaintext shape in modern web
+/// APIs; the 3-byte magic plus the reserved-flag nibble being zero makes
+/// accidental matches vanishingly rare.
+pub struct GzipOracle;
+
+impl Oracle for GzipOracle {
+    fn name(&self) -> &'static str {
+        "gzip"
+    }
+
+    fn verify(&self, plaintext_head: &[u8]) -> bool {
+        // gzip header: magic 1f 8b, CM=8 (deflate), FLG must have the
+        // reserved bits (bit 5..7) clear.
+        match plaintext_head.first() {
+            Some(0x1f) => {}
+            _ => return false,
+        }
+        if plaintext_head.get(1) != Some(&0x8b) {
+            return false;
+        }
+        if plaintext_head.get(2) != Some(&0x08) {
+            return false;
+        }
+        match plaintext_head.get(3) {
+            Some(flg) => flg & 0xe0 == 0,
+            None => false,
+        }
+    }
+
+    fn confidence(&self) -> Confidence {
+        Confidence::High
+    }
+}
+
+/// Plaintext starts like an unencrypted protobuf message whose first field is
+/// a length-delimited payload (common wire shape for signed/encrypted inner
+/// payloads).
+///
+/// Detection is a heuristic on the first varint tag: tag byte with wire type
+/// 2 (length-delimited) and field number 1..=15, followed by a plausible
+/// varint length that fits within the head. This is intentionally loose —
+/// protobuf has no magic number — so it is rated Medium.
+pub struct ProtobufOracle;
+
+impl ProtobufOracle {
+    /// Read a varint from `data`, returning (value, bytes consumed).
+    fn read_varint(data: &[u8]) -> Option<(u64, usize)> {
+        let mut value: u64 = 0;
+        let mut shift = 0u32;
+        for (i, &b) in data.iter().enumerate().take(10) {
+            value |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Some((value, i + 1));
+            }
+            shift += 7;
+        }
+        None
+    }
+}
+
+impl Oracle for ProtobufOracle {
+    fn name(&self) -> &'static str {
+        "protobuf"
+    }
+
+    fn verify(&self, plaintext_head: &[u8]) -> bool {
+        // First byte: field 1..=15, wire type 2 (length-delimited).
+        let Some(&tag) = plaintext_head.first() else {
+            return false;
+        };
+        if tag & 0x07 != 0x02 || tag >> 3 == 0 || tag >> 3 > 15 {
+            return false;
+        }
+        // Then a length varint that fits inside the head.
+        let Some((len, consumed)) = Self::read_varint(&plaintext_head[1..]) else {
+            return false;
+        };
+        let len = len as usize;
+        let available = plaintext_head.len().saturating_sub(1 + consumed);
+        len > 0 && len <= available
+    }
+
+    fn confidence(&self) -> Confidence {
+        Confidence::Medium
+    }
+}
+
 fn strip_trailing_zeros(data: &[u8]) -> &[u8] {
     let mut end = data.len();
     while end > 0 && data[end - 1] == 0 {
         end -= 1;
     }
     &data[..end]
+}
+
+/// Parse an oracle spec string (`utf8,json,known:password`) into oracle
+/// instances. Shared by the CLI and the MCP server.
+pub fn parse_spec(spec: &str) -> Result<Vec<Box<dyn Oracle>>, String> {
+    let mut oracles: Vec<Box<dyn Oracle>> = Vec::new();
+    for part in spec.split(',') {
+        match part.trim() {
+            "utf8" => oracles.push(Box::new(Utf8Oracle)),
+            "json" => oracles.push(Box::new(JsonOracle)),
+            "gzip" => oracles.push(Box::new(GzipOracle)),
+            "protobuf" => oracles.push(Box::new(ProtobufOracle)),
+            spec if spec.starts_with("known:") => {
+                oracles.push(Box::new(KnownPlaintextOracle {
+                    fragment: spec.as_bytes()["known:".len()..].to_vec(),
+                }));
+            }
+            "" => {}
+            other => {
+                return Err(format!(
+                    "unknown oracle '{other}' (utf8 | json | gzip | protobuf | known:<text>)"
+                ))
+            }
+        }
+    }
+    if oracles.is_empty() {
+        return Err("no oracle enabled".into());
+    }
+    Ok(oracles)
 }
 
 /// Runs every oracle, returns the name + confidence of the best match, or None.

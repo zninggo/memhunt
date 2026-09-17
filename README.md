@@ -1,16 +1,28 @@
 # memhunt
 
-Hunt AES keys in a memory dump from a single known ciphertext.
+Hunt keys in a memory dump from a single known artifact.
 
-During reverse engineering you often capture an encrypted request parameter but
-have no idea which key encrypted it — only that the key must still be sitting
-somewhere in the process's memory. memhunt turns that into a one-liner: slide a
-window over every byte of the dump, try each window as an AES key, and keep the
-candidates whose decryption validates against pluggable oracles.
+During reverse engineering you often capture an encrypted request parameter, a
+signature, or a hashed value — but have no idea which key produced it, only
+that the secret must still be sitting somewhere in the process's memory.
+memhunt turns that into a one-liner: slide a window over every byte of the
+dump, try each window as a key (or hash/HMAC), and keep the candidates that
+match your artifact.
 
 A modern, fast, cross-platform rewrite of the idea behind
 [HZJQF/help_tool](https://github.com/HZJQF/help_tool) (unmaintained since
-2024-10), implemented in Rust.
+2024-10), implemented in Rust. Also backports the classic memory-forensics
+technique of detecting AES expanded key schedules.
+
+## Five things it does
+
+| Mode | Artifact you have | What it finds |
+|---|---|---|
+| `scan` | a known ciphertext | the block-cipher key (AES-128/192/256, DES, 3DES-EDE3, SM4) — ECB & CBC |
+| `hash` | a digest (MD5/SHA-1/SHA-256/SM3) | the hashed bytes still resident in the dump |
+| `hash --mode hmac_key` | a MAC + the signed message | the HMAC secret key |
+| `key-schedules` | a dump, nothing else | expanded AES key schedules (key = schedule head) |
+| `serve` | an MCP client | the four modes as Model-Context-Protocol tools for AI agents |
 
 ## Install
 
@@ -24,12 +36,17 @@ cargo build --release
 
 ## Usage
 
+### Block-cipher key hunt (given a ciphertext)
+
 ```sh
 # Scan a process dump for the key behind a captured ciphertext (hex or base64)
 memhunt scan app_dump.bin --target 8a4c4056e06d89ef...
 
 # Restrict to AES-128, stop after the first hit
-memhunt scan app_dump.bin --target <ciphertext> --key-size 128 --max-hits 1
+memhunt scan app_dump.bin --target <ciphertext> --cipher aes-128 --max-hits 1
+
+# Include more ciphers (DES, 3DES, SM4) in one pass
+memhunt scan app_dump.bin --target <ciphertext> --cipher all
 
 # Pin a known plaintext fragment (strongest oracle)
 memhunt scan app_dump.bin --target <ciphertext> --oracle known:password,utf8
@@ -41,59 +58,91 @@ memhunt scan app_dump.bin --target <ciphertext> --iv 000102...0f
 memhunt scan app_dump.bin --target <ciphertext> --json
 ```
 
+`--cipher` accepts a comma-separated list: `aes-128`, `aes-192`, `aes-256`,
+`des`, `3des`, `sm4`, `aes` (= all three AES sizes), or `all`.
+
 Output goes to stdout, progress and stats to stderr. Exit codes: `0` hit
 found, `1` no hit, `2` error.
 
+### Hash preimage & HMAC-key hunt (given a digest)
+
+```sh
+# Find the hashed bytes in the dump (e.g. the plaintext behind a sign= digit)
+memhunt hash app_dump.bin --digest <hex> --mode preimage \
+    --algos md5,sha256
+
+# Recover the HMAC secret key from a captured MAC + the signed message
+memhunt hash app_dump.bin --digest <hex> --mode hmac_key \
+    --algos sha256 --message "GET /api?a=1"
+```
+
+Preimage / HMAC-key windows are scanned across the configured length range
+(`--min-len 8 --max-len 128` by default) plus the common 16/24/32/64-byte
+HMAC key sizes.
+
+### AES key-schedule detection (no ciphertext needed)
+
+```sh
+# Find expanded AES keys (the schedule head = the key itself) in the dump
+memhunt key-schedules app_dump.bin
+memhunt key-schedules app_dump.bin --json
+```
+
+Any 32-byte window whose first 16/24/32 bytes expand forward (FIPS-197) to the
+following words is a key-schedule head. False positives are ~2^-32 per window
+(4 words of agreement), so on real dumps a hit is essentially always a live
+OpenSSL-type expanded key.
+
+### MCP server (AI agents)
+
+```sh
+memhunt serve
+```
+
+Speaks Model Context Protocol over stdio (JSON-RPC 2.0, newline-delimited).
+Exposes the tools `memhunt_scan`, `memhunt_key_schedules`, `memhunt_hash_scan`.
+Point any MCP client at `memhunt serve`.
+
 ## How it works
 
-Two ideas make this practical:
+Two ideas make the ciphertext path practical:
 
-1. **Oracle-driven verification.** Instead of comparing against a known key,
-   each candidate key is validated by *what the decryption looks like*:
-   valid UTF-8 text (`utf8`), a JSON document (`json`), or a known plaintext
-   fragment (`known:<text>`). Oracles are composable and confidence-rated
-   (`known`/`json` = high, `utf8` = medium).
+1. **Oracle-driven verification.** Each candidate key is validated by *what
+   the decryption looks like*: valid UTF-8 text (`utf8`), a JSON document
+   (`json`), a plaintext fragment (`known:<text>`), or a gzip / protobuf magic
+   header. Oracles are composable and confidence-rated (`known`/`json`/`gzip`
+   = high, `utf8`/`protobuf` = medium).
 
 2. **IV-free CBC verification.** In CBC mode, blocks 1..n decrypt without the
    IV (`P[i] = D(K, C[i]) XOR C[i-1]`). memhunt verifies the key on those
-   blocks first; only after a hit does it scan the dump a second time to
-   locate the IV itself — with candidates ranked by oracle confidence to
-   reject false positives.
+   blocks first; only after a hit does it scan the dump again to locate the IV,
+   ranking candidates by oracle confidence.
 
 Only the first two ciphertext blocks are decrypted during candidate
-validation; full decryption and padding checks (pkcs7 / zero) run once per
-hit. Scan with `rayon` across all cores and AES-NI when available.
+validation; full decrypt and padding strip run once per hit. Scan with `rayon`
+across all cores and AES-NI when available. DES/3DES (8-byte blocks) and SM4
+(16-byte blocks) ride the same generic engine through a small
+version-bridging adapter.
 
 ### IV candidates
 
-Because CBC key verification is IV-independent (`P[i] = D(K, C[i]) XOR
-C[i-1]`), the IV itself is located in a second scan pass after a hit. A
-candidate IV is accepted when the concatenation of its decrypted block 0 and
-the (already-verified) following blocks passes an oracle — so `known:<text>`
-fragments in any block, and JSON structure that spans the block-0 boundary,
-are honored. Candidates are ranked by oracle confidence, then block-0
-"plaintext-likeness", then offset, and up to 8 are returned as
-`iv_candidates` (best first) in JSON output; the human report prints each.
+CBC key verification is IV-independent, so the IV is located in a second pass
+after a hit. A candidate IV is accepted when the concatenation of its
+decrypted block 0 and the (already-verified) following blocks passes an
+oracle. Candidates are ranked by oracle confidence, then block-0
+"plaintext-ness", then offset, and up to 8 are returned. Weak oracles (`utf8`
+alone) can make several IVs tie — add a `json`/`known:` oracle to pin the
+unique one.
 
-**Weak oracles are honest about ambiguity.** With `utf8` alone, many random
-16-byte windows decrypt to "printable" text, so several candidate IVs can tie —
-the top pick is best-effort, not guaranteed. Add a block-0-sensitive oracle
-(`json`, or a `known:<...>` fragment that sits in the first plaintext block) to
-pin the unique IV. The default `utf8,json` set usually resolves it.
+### Sizes
 
-### Key / ciphertext size limits
-
-Only the first two ciphertext blocks (`VERIFY_BLOCKS = 2`) are consulted to
-validate a candidate key. That means:
-- In **CBC**, a `known:<fragment>` must sit inside plaintext bytes 16..48
-  (blocks 1..2) to confirm the key.
-- In **ECB**, the fragment must sit inside plaintext bytes 0..32 (blocks 0..1).
-- Ciphertext must be a multiple of 16 bytes; single-block CBC scans need a
-  fixed `--iv`.
-
-Measured on one test machine: a 64 MiB dump scanned across all three AES key
-sizes (201M candidate windows) in ~9s — roughly 50x the throughput of the
-original Python implementation.
+- Only the first two ciphertext blocks (`VERIFY_BLOCKS = 2`) are consulted to
+  validate a candidate key.
+- Ciphertext must be a multiple of the cipher's block size (16 for AES/SM4,
+  8 for DES/3DES).
+- Single-block CBC scans need a fixed `--iv`.
+- Preimage/HMAC windows scan lengths in `--min-len..=--max-len` (default
+  8..=128) plus fixed 16/24/32/64-byte HMAC keys.
 
 ## Where dumps come from
 
@@ -116,11 +165,15 @@ Requires `openssl`; Python 3.8+ stdlib only. Exits non-zero on any failure.
 
 ## Roadmap
 
-- [ ] DES / 3DES / SM4, hash and HMAC matching (md5/sha1/sha256/sm3)
-- [ ] AES key-schedule structure detection (no ciphertext required)
-- [ ] MCP server mode for AI-agent integration
-- [ ] gzip / protobuf magic oracles
+- [x] DES / 3DES / SM4 block-cipher hunting
+- [x] MD5 / SHA-1 / SHA-256 / SM3 preimage and HMAC-key matching
+- [x] AES key-schedule structure detection (no ciphertext required)
+- [x] gzip / protobuf magic oracles
+- [x] MCP server mode for AI-agent integration
+- [ ] Rijndael-256 / Camellia / ChaCha20 (stream cipher key searches)
+- [ ] CFB / OFB / CTR mode verification
+- [ ] Runtime maps (map hits back to allocations)
 
 ## License
 
-Apache-2.0. Use only on systems you are authorized to analyze.
+Apache-2.0. Use only on systems you are explicitly authorized to analyze.

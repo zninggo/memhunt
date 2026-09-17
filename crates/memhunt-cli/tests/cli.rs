@@ -34,14 +34,7 @@ fn make_fixture() -> (std::path::PathBuf, String) {
 fn run(dump: &str, ct: &str, oracle: &str) -> std::process::Output {
     Command::new(bin())
         .args([
-            "scan",
-            dump,
-            "--oracle",
-            oracle,
-            "--target",
-            ct,
-            "--key-size",
-            "128",
+            "scan", dump, "--oracle", oracle, "--target", ct, "--cipher", "aes-128",
         ])
         .output()
         .unwrap()
