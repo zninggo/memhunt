@@ -518,3 +518,241 @@ fn gcm_random_data_with_tag_yields_no_hits() {
     let result = scan(&dump, &ciphertext, &Vec::new(), &config).unwrap();
     assert!(result.hits.is_empty(), "unexpected hits: {:?}", result.hits);
 }
+// ---------------------------------------------------------------------------
+// ChaCha20 / XChaCha20 stream cipher hunting
+// ---------------------------------------------------------------------------
+
+const CHACHA_KEY: [u8; 32] = [0x33; 32];
+const CHACHA_NONCE: [u8; 12] = [0x22; 12];
+
+#[test]
+fn chacha20_oracle_path_finds_key() {
+    use chacha20::cipher::{KeyIvInit, StreamCipher};
+    let ciphertext: Vec<u8> = {
+        let mut buf = PLAINTEXT.to_vec();
+        let mut c = chacha20::ChaCha20::new_from_slices(&CHACHA_KEY, &CHACHA_NONCE).unwrap();
+        c.apply_keystream(&mut buf);
+        buf
+    };
+
+    let mut dump = make_dump();
+    let key_offset = 90_000;
+    dump[key_offset..key_offset + 32].copy_from_slice(&CHACHA_KEY);
+
+    let config = ScanConfig {
+        ciphers: vec![CipherChoice::ChaCha20],
+        mode: CipherMode::Block,
+        nonce: Some(CHACHA_NONCE.to_vec()),
+        ..ScanConfig::default()
+    };
+    let result = scan(&dump, &ciphertext, &oracles(), &config).unwrap();
+    let hit = result
+        .hits
+        .iter()
+        .find(|h| h.key_offset == key_offset)
+        .expect("expected ChaCha20 oracle hit at planted key");
+    assert_eq!(hit.algo, "chacha20");
+    assert_eq!(hit.mode, memhunt_core::Mode::Stream);
+    assert_eq!(
+        hit.plaintext_utf8.as_deref(),
+        Some(std::str::from_utf8(PLAINTEXT).unwrap())
+    );
+}
+
+#[test]
+fn chacha20_poly1305_tag_path() {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    let real_key = [0x41u8; 32];
+    let cipher = chacha20poly1305::ChaCha20Poly1305::new(&real_key.into());
+    let a = b"req-12345";
+    let ct_tag = cipher
+        .encrypt(
+            &CHACHA_NONCE.into(),
+            Payload {
+                msg: PLAINTEXT,
+                aad: a,
+            },
+        )
+        .expect("encrypt");
+    let ciphertext = ct_tag[..PLAINTEXT.len()].to_vec();
+    let tag = ct_tag[PLAINTEXT.len()..].to_vec();
+    assert_eq!(tag.len(), 16);
+
+    let mut dump = make_dump();
+    let key_offset = 92_000;
+    dump[key_offset..key_offset + 32].copy_from_slice(&real_key);
+
+    let config = ScanConfig {
+        ciphers: vec![CipherChoice::ChaCha20],
+        mode: CipherMode::Gcm,
+        nonce: Some(CHACHA_NONCE.to_vec()),
+        tag: Some(tag.clone()),
+        aad: Some(a.to_vec()),
+        ..ScanConfig::default()
+    };
+    let result = scan(&dump, &ciphertext, &Vec::new(), &config).unwrap();
+    let hit = result
+        .hits
+        .iter()
+        .find(|h| h.key_offset == key_offset)
+        .expect("expected ChaCha20-Poly1305 tag hit at planted key");
+    assert_eq!(hit.algo, "chacha20");
+    assert_eq!(hit.matched_by, "poly1305-tag");
+    assert_eq!(
+        hit.plaintext_utf8.as_deref(),
+        Some(std::str::from_utf8(PLAINTEXT).unwrap())
+    );
+}
+
+#[test]
+fn chacha20_wrong_tag_yields_no_hits() {
+    let dump = make_dump_size(4096);
+    let ciphertext = [0x55u8; 48];
+    let config = ScanConfig {
+        ciphers: vec![CipherChoice::ChaCha20],
+        mode: CipherMode::Gcm,
+        nonce: Some(CHACHA_NONCE.to_vec()),
+        tag: Some([0x99u8; 16].to_vec()),
+        ..ScanConfig::default()
+    };
+    let result = scan(&dump, &ciphertext, &Vec::new(), &config).unwrap();
+    assert!(result.hits.is_empty(), "unexpected hits: {:?}", result.hits);
+}
+// ---------------------------------------------------------------------------
+// SM4 round-key schedule detection (structural, no ciphertext needed)
+// ---------------------------------------------------------------------------
+
+// Authoritative SM4 S-box (GB/T 32907-2016), extracted from the sm4 crate
+// source table; verified first entries d6 90 e9 fe cc e1 3d b7.
+#[rustfmt::skip]
+const SM4_TEST_SBOX: [u8; 256] = [
+0xd6, 0x90, 0xe9, 0xfe, 0xcc, 0xe1, 0x3d, 0xb7,
+0x16, 0xb6, 0x14, 0xc2, 0x28, 0xfb, 0x2c, 0x05,
+0x2b, 0x67, 0x9a, 0x76, 0x2a, 0xbe, 0x04, 0xc3,
+0xaa, 0x44, 0x13, 0x26, 0x49, 0x86, 0x06, 0x99,
+0x9c, 0x42, 0x50, 0xf4, 0x91, 0xef, 0x98, 0x7a,
+0x33, 0x54, 0x0b, 0x43, 0xed, 0xcf, 0xac, 0x62,
+0xe4, 0xb3, 0x1c, 0xa9, 0xc9, 0x08, 0xe8, 0x95,
+0x80, 0xdf, 0x94, 0xfa, 0x75, 0x8f, 0x3f, 0xa6,
+0x47, 0x07, 0xa7, 0xfc, 0xf3, 0x73, 0x17, 0xba,
+0x83, 0x59, 0x3c, 0x19, 0xe6, 0x85, 0x4f, 0xa8,
+0x68, 0x6b, 0x81, 0xb2, 0x71, 0x64, 0xda, 0x8b,
+0xf8, 0xeb, 0x0f, 0x4b, 0x70, 0x56, 0x9d, 0x35,
+0x1e, 0x24, 0x0e, 0x5e, 0x63, 0x58, 0xd1, 0xa2,
+0x25, 0x22, 0x7c, 0x3b, 0x01, 0x21, 0x78, 0x87,
+0xd4, 0x00, 0x46, 0x57, 0x9f, 0xd3, 0x27, 0x52,
+0x4c, 0x36, 0x02, 0xe7, 0xa0, 0xc4, 0xc8, 0x9e,
+0xea, 0xbf, 0x8a, 0xd2, 0x40, 0xc7, 0x38, 0xb5,
+0xa3, 0xf7, 0xf2, 0xce, 0xf9, 0x61, 0x15, 0xa1,
+0xe0, 0xae, 0x5d, 0xa4, 0x9b, 0x34, 0x1a, 0x55,
+0xad, 0x93, 0x32, 0x30, 0xf5, 0x8c, 0xb1, 0xe3,
+0x1d, 0xf6, 0xe2, 0x2e, 0x82, 0x66, 0xca, 0x60,
+0xc0, 0x29, 0x23, 0xab, 0x0d, 0x53, 0x4e, 0x6f,
+0xd5, 0xdb, 0x37, 0x45, 0xde, 0xfd, 0x8e, 0x2f,
+0x03, 0xff, 0x6a, 0x72, 0x6d, 0x6c, 0x5b, 0x51,
+0x8d, 0x1b, 0xaf, 0x92, 0xbb, 0xdd, 0xbc, 0x7f,
+0x11, 0xd9, 0x5c, 0x41, 0x1f, 0x10, 0x5a, 0xd8,
+0x0a, 0xc1, 0x31, 0x88, 0xa5, 0xcd, 0x7b, 0xbd,
+0x2d, 0x74, 0xd0, 0x12, 0xb8, 0xe5, 0xb4, 0xb0,
+0x89, 0x69, 0x97, 0x4a, 0x0c, 0x96, 0x77, 0x7e,
+0x65, 0xb9, 0xf1, 0x09, 0xc5, 0x6e, 0xc6, 0x84,
+0x18, 0xf0, 0x7d, 0xec, 0x3a, 0xdc, 0x4d, 0x20,
+0x79, 0xee, 0x5f, 0x3e, 0xd7, 0xcb, 0x39, 0x48,
+];
+
+#[test]
+fn sm4_schedule_head_detection() {
+    let sm4_key: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10,
+    ];
+    let fk = [0xa3b1bac6u32, 0x56aa3350, 0x677d9197, 0xb27022dc];
+    let ck0 = [0x00070e15u32, 0x1c232a31, 0x383f464d, 0x545b6269];
+    let mk = [
+        u32::from_be_bytes(sm4_key[0..4].try_into().unwrap()),
+        u32::from_be_bytes(sm4_key[4..8].try_into().unwrap()),
+        u32::from_be_bytes(sm4_key[8..12].try_into().unwrap()),
+        u32::from_be_bytes(sm4_key[12..16].try_into().unwrap()),
+    ];
+    let mut k = [mk[0] ^ fk[0], mk[1] ^ fk[1], mk[2] ^ fk[2], mk[3] ^ fk[3]];
+    let t_prime = |a: u32| {
+        let mut buf = a.to_be_bytes();
+        for b in buf.iter_mut() {
+            *b = SM4_TEST_SBOX[*b as usize];
+        }
+        let v = u32::from_be_bytes(buf);
+        v ^ v.rotate_left(13) ^ v.rotate_left(23)
+    };
+    for j in 0..4 {
+        let input = match j {
+            0 => k[1] ^ k[2] ^ k[3] ^ ck0[0],
+            1 => k[2] ^ k[3] ^ k[0] ^ ck0[1],
+            2 => k[3] ^ k[0] ^ k[1] ^ ck0[2],
+            _ => k[0] ^ k[1] ^ k[2] ^ ck0[3],
+        };
+        k[j] ^= t_prime(input);
+    }
+
+    let mut dump = make_dump();
+    let off = 110_000;
+    dump[off..off + 16].copy_from_slice(&sm4_key);
+    dump[off + 16..off + 20].copy_from_slice(&k[0].to_be_bytes());
+
+    let result = memhunt_core::scan_key_schedules(&dump);
+    let hit = result
+        .hits
+        .iter()
+        .find(|h| h.offset == off && h.algo == "sm4")
+        .expect("expected SM4 schedule hit at planted key");
+    assert_eq!(hit.key_hex, hex::encode(sm4_key));
+}
+
+// ---------------------------------------------------------------------------
+// UTF-16LE oracle
+// ---------------------------------------------------------------------------
+
+#[test]
+fn utf16le_oracle_matches_utf16_text() {
+    let oracle = memhunt_core::Utf16LeOracle;
+    let wide: Vec<u8> = br#"{"user":"admin","ok":true}"#.iter().flat_map(|&b| [b, 0u8]).collect();
+    assert!(oracle.verify(&wide), "ascii utf16le must pass");
+    let mut padded = wide.clone();
+    padded.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    assert!(oracle.verify(&padded), "trailing utf16 zero-pad tolerated");
+    let random: Vec<u8> = (0..32).map(|i| (i as u8).wrapping_mul(7)).collect();
+    assert!(!oracle.verify(&random), "non-utf16 must fail");
+    let all_a: Vec<u8> = [b'a', 0].iter().copied().cycle().take(32).collect();
+    assert!(!oracle.verify(&all_a), "single repeated unit rejected");
+}
+
+#[test]
+fn utf16_end_to_end_hunt() {
+    use chacha20::cipher::{KeyIvInit, StreamCipher};
+    // Plaintext is a UTF-16LE JSON string, encrypted with ChaCha20 (which the
+    // utf8 oracle would reject but utf16le accepts).
+    let wide_pt: Vec<u8> =
+        br#"{"order":"ORD-9","amount":5}"#.iter().flat_map(|&b| [b, 0u8]).collect();
+    let key = [0x51u8; 32];
+    let mut ct = wide_pt.clone();
+    let mut c = chacha20::ChaCha20::new_from_slices(&key, &[0x44u8; 12]).unwrap();
+    c.apply_keystream(&mut ct);
+
+    let mut dump = make_dump();
+    let off = 95_000;
+    dump[off..off + 32].copy_from_slice(&key);
+
+    let config = ScanConfig {
+        ciphers: vec![CipherChoice::ChaCha20],
+        mode: CipherMode::Block,
+        nonce: Some([0x44u8; 12].to_vec()),
+        ..ScanConfig::default()
+    };
+    let utf16_oracle: Vec<Box<dyn Oracle>> = vec![Box::new(memhunt_core::Utf16LeOracle)];
+    let result = scan(&dump, &ct, &utf16_oracle, &config).unwrap();
+    let hit = result
+        .hits
+        .iter()
+        .find(|h| h.key_offset == off)
+        .expect("expected UTF-16LE oracle hit at planted key");
+    assert_eq!(hit.matched_by, "utf16le");
+}

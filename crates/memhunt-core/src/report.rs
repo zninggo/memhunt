@@ -25,6 +25,7 @@ pub enum Mode {
     Cbc,
     Ctr,
     Gcm,
+    Stream,
 }
 
 /// One plausible IV location found by the IV scan pass.

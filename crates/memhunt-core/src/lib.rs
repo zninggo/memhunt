@@ -24,6 +24,7 @@ pub use hash_scan::{
 };
 pub use keysched::{scan_key_schedules, KeyScheduleHit, KeyScheduleResult};
 pub use oracle::{
-    best_match, GzipOracle, JsonOracle, KnownPlaintextOracle, Oracle, ProtobufOracle, Utf8Oracle,
+    best_match, GzipOracle, JsonOracle, KnownPlaintextOracle, Oracle, ProtobufOracle,
+    Utf16LeOracle, Utf8Oracle,
 };
 pub use report::{Confidence, Hit, Mode, ScanResult, ScanStats};

@@ -30,7 +30,7 @@ enum Command {
         #[arg(long, default_value = "auto")]
         encoding: String,
 
-        /// Comma-separated oracles: utf8, json, gzip, protobuf, known:<fragment>.
+        /// Comma-separated oracles: utf8, utf16le, json, gzip, protobuf, known:<fragment>.
         #[arg(long, default_value = "utf8,json")]
         oracle: String,
 

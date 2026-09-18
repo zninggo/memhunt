@@ -94,6 +94,53 @@ impl Oracle for KnownPlaintextOracle {
     }
 }
 
+/// Plaintext decodes as UTF-16LE with mostly-printable Latin/BMP characters.
+///
+/// Windows and Java applications keep strings as UTF-16LE in memory, so dumps
+/// from `ReadProcessMemory` / JVM processes decrypt to UTF-16LE text that the
+/// `utf8` oracle cannot see. Every other byte is a NUL for ASCII-range text —
+/// a strong structural signature on its own.
+pub struct Utf16LeOracle;
+
+impl Oracle for Utf16LeOracle {
+    fn name(&self) -> &'static str {
+        "utf16le"
+    }
+
+    fn verify(&self, plaintext_head: &[u8]) -> bool {
+        // UTF-16LE strings naturally end with a 0x00 high byte, so stripping
+        // trailing zeros would eat half a code unit. Strip only full 0x0000
+        // units (2 bytes at a time), then require an even byte count.
+        let mut end = plaintext_head.len();
+        while end >= 4 && plaintext_head[end - 2] == 0 && plaintext_head[end - 1] == 0 {
+            end -= 2;
+        }
+        let head = &plaintext_head[..end];
+        if head.len() < 8 || !head.len().is_multiple_of(2) {
+            return false;
+        }
+        let units: Vec<u16> = head
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        // ASCII-range text dominates real-world UTF-16LE plaintexts: every
+        // unit < 0x80, i.e. byte pairs (char, 0x00). Require >= 3/4 of units
+        // to be printable ASCII to cut false positives, and no lone NUL unit.
+        let printable = units.iter().filter(|&&u| (0x20..0x7f).contains(&u)).count();
+        if printable * 4 < units.len() * 3 {
+            return false;
+        }
+        // Reject all-NUL or single repeated char (padding artifacts).
+        units.iter().any(|&u| u != 0) && units.iter().any(|&u| u != units[0])
+    }
+
+    fn confidence(&self) -> Confidence {
+        Confidence::Medium
+    }
+}
+
 /// Plaintext starts with the gzip magic bytes `1f 8b 08` (deflate stream).
 ///
 /// Compressed request bodies are a common plaintext shape in modern web
@@ -200,6 +247,7 @@ pub fn parse_spec(spec: &str) -> Result<Vec<Box<dyn Oracle>>, String> {
             "utf8" => oracles.push(Box::new(Utf8Oracle)),
             "json" => oracles.push(Box::new(JsonOracle)),
             "gzip" => oracles.push(Box::new(GzipOracle)),
+            "utf16le" | "utf16" => oracles.push(Box::new(Utf16LeOracle)),
             "protobuf" => oracles.push(Box::new(ProtobufOracle)),
             spec if spec.starts_with("known:") => {
                 oracles.push(Box::new(KnownPlaintextOracle {
@@ -209,8 +257,8 @@ pub fn parse_spec(spec: &str) -> Result<Vec<Box<dyn Oracle>>, String> {
             "" => {}
             other => {
                 return Err(format!(
-                    "unknown oracle '{other}' (utf8 | json | gzip | protobuf | known:<text>)"
-                ))
+                "unknown oracle '{other}' (utf8 | utf16le | json | gzip | protobuf | known:<text>)"
+            ))
             }
         }
     }

@@ -72,12 +72,16 @@ memhunt scan app_dump.bin --target <ciphertext> --json
 ```
 
 `--cipher` accepts a comma-separated list: `aes-128`, `aes-192`, `aes-256`,
-`des`, `3des`, `sm4`, `aes` (= all three AES sizes), or `all`. AES tokens may
-also use a `-ctr` or `-gcm` suffix, such as `aes-128-ctr` or `aes-gcm`. CTR
-requires a 16-byte initial counter block in `--nonce`; GCM requires a 12-byte
-nonce. GCM accepts optional `--tag` (16 bytes) and `--aad` (hex). A tagged GCM
-scan verifies keys cryptographically and needs no oracle; without a tag it uses
-the configured oracles. All tokens in one list must select the same mode.
+`des`, `3des`, `sm4`, `chacha20`, `xchacha20`, `aes` (= all three AES sizes),
+`chacha20-poly1305`, `xchacha20-poly1305`, or `all`. AES tokens may also use a
+`-ctr` or `-gcm` suffix, such as `aes-128-ctr` or `aes-gcm`. CTR requires a
+16-byte initial counter block in `--nonce`; GCM a 12-byte nonce. GCM accepts
+optional `--tag` (16 bytes) and `--aad` (hex); a tagged scan verifies keys
+cryptographically and needs no oracle. ChaCha20 takes a 12-byte nonce,
+XChaCha20 a 24-byte nonce; `--tag` turns a ChaCha hunt into Poly1305 AEAD
+verification (with optional `--aad`). Block-mode tokens (`des`, `3des`, `sm4`) may not
+mix with AES modes or stream ciphers. All tokens in one list must select the
+same mode.
 
 Output goes to stdout, progress and stats to stderr. Exit codes: `0` hit
 found, `1` no hit, `2` error.
@@ -219,6 +223,8 @@ Requires `openssl`; Python 3.8+ stdlib only. Exits non-zero on any failure.
 ## Roadmap
 
 - [x] DES / 3DES / SM4 block-cipher hunting
+- [x] ChaCha20 / XChaCha20 stream-cipher and Poly1305-AEAD hunting
+- [x] SM4 round-key schedule structure detection (no ciphertext required)
 - [x] MD5 / SHA-1 / SHA-256 / SM3 preimage and HMAC-key matching
 - [x] AES key-schedule structure detection (no ciphertext required)
 - [x] gzip / protobuf magic oracles

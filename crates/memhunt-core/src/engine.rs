@@ -68,6 +68,8 @@ pub enum CipherChoice {
     Des,
     TdesEde3,
     Sm4,
+    ChaCha20,
+    XChaCha20,
 }
 
 impl CipherChoice {
@@ -79,11 +81,17 @@ impl CipherChoice {
             Self::Des => "des",
             Self::TdesEde3 => "3des-ede3",
             Self::Sm4 => "sm4",
+            Self::ChaCha20 => "chacha20",
+            Self::XChaCha20 => "xchacha20",
         }
     }
 
     pub fn is_aes(&self) -> bool {
         matches!(self, Self::Aes128 | Self::Aes192 | Self::Aes256)
+    }
+
+    pub fn is_stream_cipher(&self) -> bool {
+        matches!(self, Self::ChaCha20 | Self::XChaCha20)
     }
 
     /// Parse a cipher list. Tokens may select CTR or GCM with a `-ctr` or
@@ -112,6 +120,16 @@ impl CipherChoice {
                 "aes-192" | "aes192" => out.push(Self::Aes192),
                 "aes-256" | "aes256" => out.push(Self::Aes256),
                 "aes" => out.extend([Self::Aes128, Self::Aes192, Self::Aes256]),
+                "chacha20" | "chacha" => out.push(Self::ChaCha20),
+                "xchacha20" | "xchacha" => out.push(Self::XChaCha20),
+                "chacha20poly1305" | "chacha20-poly1305" => {
+                    out.push(Self::ChaCha20);
+                    mode = Some(CipherMode::Gcm);
+                }
+                "xchacha20poly1305" | "xchacha20-poly1305" => {
+                    out.push(Self::XChaCha20);
+                    mode = Some(CipherMode::Gcm);
+                }
                 "des" if token_mode == CipherMode::Block => out.push(Self::Des),
                 "3des" | "3des-ede3" | "tdes" if token_mode == CipherMode::Block => {
                     out.push(Self::TdesEde3)
@@ -120,7 +138,7 @@ impl CipherChoice {
                 "all" if token_mode == CipherMode::Block => out.extend(Self::all()),
                 other => {
                     return Err(format!(
-                        "unknown cipher '{other}' (aes-128 | aes-192 | aes-256 | des | 3des | sm4 | all | aes-<size>-ctr | aes-<size>-gcm)"
+                        "unknown cipher '{other}' (aes-128 | aes-192 | aes-256 | des | 3des | sm4 | chacha20 | xchacha20 | all | aes-<size>-ctr | aes-<size>-gcm)"
                     ))
                 }
             }
@@ -141,7 +159,7 @@ impl CipherChoice {
         })
     }
 
-    pub fn all() -> [Self; 6] {
+    pub fn all() -> [Self; 8] {
         [
             Self::Aes128,
             Self::Aes192,
@@ -149,6 +167,8 @@ impl CipherChoice {
             Self::Des,
             Self::TdesEde3,
             Self::Sm4,
+            Self::ChaCha20,
+            Self::XChaCha20,
         ]
     }
 
@@ -160,6 +180,17 @@ impl CipherChoice {
             Self::Des => Box::new(crate::cipher_adapter::des()),
             Self::TdesEde3 => Box::new(crate::cipher_adapter::tdes_ede3()),
             Self::Sm4 => Box::new(crate::cipher_adapter::sm4()),
+            Self::ChaCha20 | Self::XChaCha20 => {
+                unreachable!("stream ciphers have no BlockCipher adapter")
+            }
+        }
+    }
+
+    fn stream_adapter(&self) -> Box<dyn crate::cipher_adapter::StreamCipherAdapter> {
+        match self {
+            Self::ChaCha20 => Box::new(crate::cipher_adapter::chacha20()),
+            Self::XChaCha20 => Box::new(crate::cipher_adapter::xchacha20()),
+            _ => unreachable!("only stream ciphers have a StreamCipherAdapter"),
         }
     }
 }
@@ -249,6 +280,52 @@ fn block0_plausibility(block: &[u8]) -> u32 {
 }
 
 fn validate_config(config: &ScanConfig) -> Result<(), String> {
+    // Stream ciphers (ChaCha family) take their own path: nonce length is
+    // fixed per cipher (12 for ChaCha20 IETF, 24 for XChaCha20); a tag
+    // switches the hunt to Poly1305 AEAD verification.
+    if config
+        .ciphers
+        .iter()
+        .any(|choice| choice.is_stream_cipher())
+    {
+        if config
+            .ciphers
+            .iter()
+            .any(|choice| !choice.is_stream_cipher())
+        {
+            return Err("stream ciphers cannot be mixed with block ciphers".into());
+        }
+        if config.fixed_iv.is_some() {
+            return Err("use --nonce, not --iv, for stream ciphers".into());
+        }
+        let nonce = config
+            .nonce
+            .as_deref()
+            .ok_or("nonce is required for stream ciphers")?;
+        let has_xchacha = config.ciphers.iter().any(|c| c == &CipherChoice::XChaCha20);
+        let has_chacha = config.ciphers.iter().any(|c| c == &CipherChoice::ChaCha20);
+        if has_xchacha && nonce.len() != 24 {
+            return Err(format!(
+                "XChaCha20 requires a 24-byte nonce (got {})",
+                nonce.len()
+            ));
+        }
+        if has_chacha && nonce.len() != 12 {
+            return Err(format!(
+                "ChaCha20 requires a 12-byte nonce (got {})",
+                nonce.len()
+            ));
+        }
+        if let Some(tag) = config.tag.as_deref() {
+            if tag.len() != 16 {
+                return Err("Poly1305 tag must be 16 bytes".into());
+            }
+        }
+        if config.mode == CipherMode::Ctr {
+            return Err("CTR is AES-only; chacha20 is already a stream cipher".into());
+        }
+        return Ok(());
+    }
     match config.mode {
         CipherMode::Block => {
             if config.nonce.is_some() {
@@ -317,60 +394,78 @@ pub fn scan(
     let mut all_hits: Vec<Hit> = Vec::new();
 
     for choice in &config.ciphers {
-        let cipher = choice.adapter();
-        let block = cipher.block_len();
-        let key_len = cipher.key_len();
-        if dump.len() < key_len {
-            continue;
-        }
-        let algo = cipher.algo().to_string();
+        let algo = choice.label().to_string();
 
-        let hits = if config.mode == CipherMode::Block {
-            let blocks = split_blocks(ciphertext, block)?;
-            let iv = config
-                .fixed_iv
-                .as_ref()
-                .map(|iv| {
-                    let arr: &[u8] = iv;
-                    if arr.len() != block {
-                        return Err(format!(
-                            "fixed IV length {} does not match {} block size {}",
-                            arr.len(),
-                            algo,
-                            block
-                        ));
-                    }
-                    Ok(arr.to_vec())
-                })
-                .transpose()?;
-
-            hunt(
+        let hits = if choice.is_stream_cipher() {
+            if ciphertext.is_empty() {
+                return Err("ciphertext is empty".into());
+            }
+            let adapter = choice.stream_adapter();
+            hunt_stream_cipher(
                 dump,
-                &blocks,
-                block,
-                cipher.as_ref(),
+                ciphertext,
+                adapter.as_ref(),
                 oracles,
                 config,
                 &algo,
-                iv,
                 &tried,
                 &stop,
             )
         } else {
-            if ciphertext.is_empty() {
-                return Err("ciphertext is empty".into());
+            let cipher = choice.adapter();
+            let block = cipher.block_len();
+            let key_len = cipher.key_len();
+            if dump.len() < key_len {
+                continue;
             }
-            hunt_stream(
-                dump,
-                ciphertext,
-                block,
-                cipher.as_ref(),
-                oracles,
-                config,
-                &algo,
-                &tried,
-                &stop,
-            )
+
+            if config.mode == CipherMode::Block {
+                let blocks = split_blocks(ciphertext, block)?;
+                let iv = config
+                    .fixed_iv
+                    .as_ref()
+                    .map(|iv| {
+                        let arr: &[u8] = iv;
+                        if arr.len() != block {
+                            return Err(format!(
+                                "fixed IV length {} does not match {} block size {}",
+                                arr.len(),
+                                algo,
+                                block
+                            ));
+                        }
+                        Ok(arr.to_vec())
+                    })
+                    .transpose()?;
+
+                hunt(
+                    dump,
+                    &blocks,
+                    block,
+                    cipher.as_ref(),
+                    oracles,
+                    config,
+                    &algo,
+                    iv,
+                    &tried,
+                    &stop,
+                )
+            } else {
+                if ciphertext.is_empty() {
+                    return Err("ciphertext is empty".into());
+                }
+                hunt_stream(
+                    dump,
+                    ciphertext,
+                    block,
+                    cipher.as_ref(),
+                    oracles,
+                    config,
+                    &algo,
+                    &tried,
+                    &stop,
+                )
+            }
         };
         all_hits.extend(hits);
         if config.max_hits > 0 && all_hits.len() >= config.max_hits {
@@ -587,6 +682,97 @@ fn hunt_stream(
             let head = stream_decrypt(cipher, key, &ciphertext[..verify_len], nonce, config.mode)?;
             let (name, confidence) = best_match(oracles, &head)?;
             let plaintext = stream_decrypt(cipher, key, ciphertext, nonce, config.mode)?;
+            Some(finalize_stream_hit(
+                algo, mode, key, offset, nonce, plaintext, name, confidence,
+            ))
+        })
+        .collect()
+}
+
+/// ChaCha20-Poly1305 / XChaCha20-Poly1305 AEAD decryption with tag check.
+fn decrypt_poly1305_tagged(
+    algo: &str,
+    key: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8],
+    aad: &[u8],
+) -> Option<Vec<u8>> {
+    use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+    let mut plaintext = ciphertext.to_vec();
+    let result = match algo {
+        "chacha20" => {
+            let nonce = chacha20poly1305::Nonce::from_slice(nonce);
+            let tag = chacha20poly1305::Tag::from_slice(tag);
+            chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)
+                .ok()?
+                .decrypt_in_place_detached(nonce, aad, &mut plaintext, tag)
+        }
+        "xchacha20" => {
+            let nonce = chacha20poly1305::XNonce::from_slice(nonce);
+            let tag = chacha20poly1305::Tag::from_slice(tag);
+            chacha20poly1305::XChaCha20Poly1305::new_from_slice(key)
+                .ok()?
+                .decrypt_in_place_detached(nonce, aad, &mut plaintext, tag)
+        }
+        _ => return None,
+    };
+    result.ok()?;
+    Some(plaintext)
+}
+
+/// Hunt pure stream ciphers (ChaCha20 / XChaCha20): with a tag, Poly1305
+/// AEAD verification (zero false positives); without, oracle-driven over the
+/// keystream-decrypted head.
+#[allow(clippy::too_many_arguments)]
+fn hunt_stream_cipher(
+    dump: &[u8],
+    ciphertext: &[u8],
+    adapter: &dyn crate::cipher_adapter::StreamCipherAdapter,
+    oracles: &[Box<dyn Oracle>],
+    config: &ScanConfig,
+    algo: &str,
+    tried: &AtomicU64,
+    stop: &AtomicBool,
+) -> Vec<Hit> {
+    let key_len = adapter.key_len();
+    let nonce = config.nonce.as_deref().unwrap_or_default();
+    let verify_len = (VERIFY_BLOCKS * 16).min(ciphertext.len());
+    let tag = config.tag.as_deref();
+    let aad = config.aad.as_deref().unwrap_or_default();
+    let mode = Mode::Stream;
+
+    dump.par_windows(key_len)
+        .enumerate()
+        .filter(|_| !stop.load(Ordering::Relaxed))
+        .filter_map(|(offset, key)| {
+            tried.fetch_add(1, Ordering::Relaxed);
+
+            if let Some(tag) = tag {
+                // AEAD path: Poly1305 tag verification is deterministic.
+                let plaintext = decrypt_poly1305_tagged(algo, key, nonce, ciphertext, tag, aad)?;
+                return Some(finalize_stream_hit(
+                    algo,
+                    mode,
+                    key,
+                    offset,
+                    nonce,
+                    plaintext,
+                    "poly1305-tag",
+                    Confidence::High,
+                ));
+            }
+
+            // Oracle path: decrypt the head with the keystream and validate.
+            let mut head = ciphertext[..verify_len].to_vec();
+            if !adapter.xor_keystream(key, nonce, &mut head) {
+                return None;
+            }
+            let (name, confidence) = best_match(oracles, &head)?;
+            let mut plaintext = ciphertext.to_vec();
+            if !adapter.xor_keystream(key, nonce, &mut plaintext) {
+                return None;
+            }
             Some(finalize_stream_hit(
                 algo, mode, key, offset, nonce, plaintext, name, confidence,
             ))
